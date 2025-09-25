@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+venv/
+.venv/
+.env
+
+# Poetry
+poetry.lock
+
+# Node
+node_modules/
+.next/
+out/
+frontend/.next/
+frontend/node_modules/
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# State
+*.sqlite3
+logs/
+
+# Coverage
+htmlcov/
+.coverage*
+
+# Docker
+*.pid
+
+# Cypress
+frontend/cypress/videos/
+frontend/cypress/screenshots/
