@@ -37,3 +37,6 @@ htmlcov/
 # Cypress
 frontend/cypress/videos/
 frontend/cypress/screenshots/
+
+# Local storage
+storage/
