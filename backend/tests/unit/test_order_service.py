@@ -151,3 +151,41 @@ async def test_calculate_planner_quote_multi_week(session, menu_week, order_wind
     assert quote.weeks[2].menu_status in {"pending", "empty"}
     assert quote.items
     assert quote.items[0].offer_id == first_offer.id
+
+
+@pytest.mark.asyncio
+async def test_calculate_planner_quote_pending_week_freezes_price(session, menu_week, order_window):
+    menu_service = MenuService(session)
+    window_service = OrderWindowService(session)
+    service = OrderService(session, menu_service=menu_service, window_service=window_service)
+
+    first_offer = (
+        await session.execute(select(DayOffer).where(DayOffer.week_id == menu_week.id))
+    ).scalar_one()
+
+    assert menu_week.week_start is not None
+    future_week_start = menu_week.week_start + timedelta(days=7)
+
+    weeks = [
+        PlannerWeekRequest(
+            week_start=menu_week.week_start,
+            enabled=True,
+            selections=[PlannerSelection(offer_id=first_offer.id, portions=1)],
+        ),
+        PlannerWeekRequest(
+            week_start=future_week_start,
+            enabled=True,
+            selections=[PlannerSelection(offer_id=first_offer.id, portions=2)],
+        ),
+    ]
+
+    quote = await service.calculate_planner_quote(selections=[], weeks=weeks)
+
+    assert len(quote.weeks) == 2
+    assert quote.weeks[1].menu_status == "pending"
+    assert quote.weeks[1].subtotal == 2 * first_offer.price_amount
+    assert quote.weeks[1].items
+    reserved_line = quote.weeks[1].items[0]
+    assert reserved_line.status == "reserved"
+    assert reserved_line.subtotal == 2 * first_offer.price_amount
+    assert reserved_line.message and "Меню уточняется" in reserved_line.message

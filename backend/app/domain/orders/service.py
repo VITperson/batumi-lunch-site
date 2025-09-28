@@ -541,7 +541,7 @@ def _build_week_quote(
     warnings: list[str] = []
     subtotal = 0
     currency: str | None = None
-    menu_status = "pending" if not has_menu_row else "published"
+    menu_status = "published" if has_menu_row else "pending"
 
     for offer_id, requested in aggregated.items():
         offer = offers.get(offer_id)
@@ -642,7 +642,7 @@ def _build_week_quote(
             )
         )
 
-        if menu_status == "pending":
+        if menu_status == "pending" and has_menu_row:
             menu_status = "published"
 
     return PlannerWeekQuote(
