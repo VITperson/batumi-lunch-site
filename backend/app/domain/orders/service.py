@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.db.models.enums import DayOfferStatus, DayOfWeek, OrderStatus, UserRole
 from app.db.models.menu import DayOffer, MenuItem, MenuWeek
 from app.db.models.order import Order
+from app.db.models.order_template import OrderTemplate, OrderTemplateWeek
 from app.db.models.user import User
 
 from ..menu import MenuService
@@ -90,6 +91,31 @@ class PlannerQuote:
     delivery_zone: str | None
     delivery_available: bool
     weeks: list[PlannerWeekQuote]
+
+
+@dataclass(slots=True)
+class PlannerCheckoutWeek:
+    index: int
+    week_start: date | None
+    label: str | None
+    enabled: bool
+    menu_status: str
+    subtotal: int
+    currency: str | None
+    warnings: list[str]
+
+
+@dataclass(slots=True)
+class PlannerCheckoutResult:
+    template_id: uuid.UUID
+    subtotal: int
+    discount: int
+    total: int
+    currency: str
+    promo_code: str | None
+    delivery_zone: str | None
+    delivery_available: bool
+    weeks: list[PlannerCheckoutWeek]
 
 
 _PROMO_CODES: dict[str, dict[str, int | str]] = {
@@ -227,11 +253,144 @@ class OrderService:
         address: str | None = None,
         weeks: list[PlannerWeekRequest] | None = None,
     ) -> PlannerQuote:
-        week_requests = weeks if weeks is not None else [
-            PlannerWeekRequest(week_start=None, selections=selections, enabled=True)
+        week_requests = self._normalize_week_requests(selections, weeks)
+        return await self._build_planner_quote(
+            week_requests=week_requests,
+            promo_code=promo_code,
+            address=address,
+        )
+
+    async def create_planner_template(
+        self,
+        *,
+        user: User | None,
+        selections: list[PlannerSelection],
+        weeks: list[PlannerWeekRequest] | None,
+        address: str,
+        promo_code: str | None = None,
+        repeat_weeks: bool = True,
+        weeks_count: int = 1,
+    ) -> PlannerCheckoutResult:
+        normalized_address = address.strip()
+        if not normalized_address:
+            raise ValidationError(field="address", message="Адрес доставки обязателен")
+
+        week_requests = self._normalize_week_requests(selections, weeks)
+        quote = await self._build_planner_quote(
+            week_requests=week_requests,
+            promo_code=promo_code,
+            address=normalized_address,
+        )
+
+        has_enabled_items = any(week.enabled and week.items for week in quote.weeks)
+        if not has_enabled_items:
+            raise ValidationError(field="selections", message="Выберите хотя бы один день для заказа")
+
+        stored_weeks_count = max(len(week_requests), weeks_count)
+        template = OrderTemplate(
+            user_id=user.id if user else None,
+            base_week_start=week_requests[0].week_start if week_requests else None,
+            weeks_count=stored_weeks_count,
+            repeat_weeks=repeat_weeks,
+            address=normalized_address,
+            promo_code=quote.promo_code,
+            subtotal=quote.subtotal,
+            discount=quote.discount,
+            total=quote.total,
+            currency=quote.currency,
+            delivery_zone=quote.delivery_zone,
+            delivery_available=quote.delivery_available,
+        )
+        self.session.add(template)
+        await self.session.flush()
+
+        for index, (request, week_quote) in enumerate(zip(week_requests, quote.weeks)):
+            selections_payload = [
+                {"offerId": str(selection.offer_id), "portions": selection.portions}
+                for selection in request.selections
+            ]
+            items_payload = [
+                {
+                    "offerId": str(item.offer_id),
+                    "day": item.day,
+                    "status": item.status,
+                    "requestedPortions": item.requested_portions,
+                    "acceptedPortions": item.accepted_portions,
+                    "unitPrice": item.unit_price,
+                    "currency": item.currency,
+                    "subtotal": item.subtotal,
+                    "message": item.message,
+                }
+                for item in week_quote.items
+            ]
+            week_row = OrderTemplateWeek(
+                template_id=template.id,
+                week_index=index,
+                week_start=request.week_start,
+                enabled=week_quote.enabled,
+                menu_status=week_quote.menu_status,
+                label=week_quote.week_label,
+                subtotal=week_quote.subtotal,
+                currency=week_quote.currency,
+                selections=selections_payload,
+                items=items_payload,
+                warnings=week_quote.warnings,
+            )
+            self.session.add(week_row)
+
+        await self.session.flush()
+
+        weeks_summary = [
+            PlannerCheckoutWeek(
+                index=index,
+                week_start=week.week_start,
+                label=week.week_label,
+                enabled=week.enabled,
+                menu_status=week.menu_status,
+                subtotal=week.subtotal,
+                currency=week.currency,
+                warnings=week.warnings,
+            )
+            for index, week in enumerate(quote.weeks)
         ]
+
+        return PlannerCheckoutResult(
+            template_id=template.id,
+            subtotal=quote.subtotal,
+            discount=quote.discount,
+            total=quote.total,
+            currency=quote.currency,
+            promo_code=quote.promo_code,
+            delivery_zone=quote.delivery_zone,
+            delivery_available=quote.delivery_available,
+            weeks=weeks_summary,
+        )
+
+    def _normalize_week_requests(
+        self,
+        selections: list[PlannerSelection],
+        weeks: list[PlannerWeekRequest] | None,
+    ) -> list[PlannerWeekRequest]:
+        if weeks:
+            return [
+                PlannerWeekRequest(
+                    week_start=week.week_start,
+                    selections=list(week.selections),
+                    enabled=week.enabled,
+                )
+                for week in weeks
+            ]
+        return [PlannerWeekRequest(week_start=None, selections=selections, enabled=True)]
+
+    async def _build_planner_quote(
+        self,
+        *,
+        week_requests: list[PlannerWeekRequest],
+        promo_code: str | None,
+        address: str | None,
+    ) -> PlannerQuote:
         if not week_requests:
-            week_requests = [PlannerWeekRequest(week_start=None, selections=selections, enabled=True)]
+            week_requests = [PlannerWeekRequest(week_start=None, selections=[], enabled=True)]
 
         week_quotes = await self._calculate_multi_week_quotes(week_requests)
 
@@ -363,6 +522,7 @@ def _build_week_quote(
             aggregated[selection.offer_id] += selection.portions
 
     has_menu_row = request.week_start is not None and request.week_start in weeks_map
+    is_pending_menu = request.week_start is not None and not has_menu_row
 
     if not aggregated:
         menu_status = "empty" if has_menu_row else "pending"
@@ -405,6 +565,24 @@ def _build_week_quote(
 
         offer_week_start = offer.week.week_start if offer.week else None
         if request.week_start and offer_week_start and offer_week_start != request.week_start:
+            if is_pending_menu:
+                currency = offer.price_currency
+                subtotal += requested * offer.price_amount
+                items.append(
+                    PlannerLine(
+                        offer_id=offer.id,
+                        day=offer.day_of_week.value,
+                        status="reserved",
+                        requested_portions=requested,
+                        accepted_portions=requested,
+                        unit_price=offer.price_amount,
+                        currency=offer.price_currency,
+                        subtotal=requested * offer.price_amount,
+                        message="Меню уточняется: закрепили текущую цену",
+                    )
+                )
+                continue
+
             message = "Предложение относится к другой неделе"
             warnings.append(message)
             items.append(
@@ -589,4 +767,6 @@ __all__ = [
     "PlannerQuote",
     "PlannerWeekRequest",
     "PlannerWeekQuote",
+    "PlannerCheckoutWeek",
+    "PlannerCheckoutResult",
 ]
