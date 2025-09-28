@@ -1,235 +1,277 @@
-"""Utility to migrate legacy JSON data into the PostgreSQL database."""
+"""Migrate legacy JSON storage into the relational database.
+
+The script is idempotent: running multiple times keeps data consistent.
+It expects the legacy files `users.json`, `orders.json`, `menu.json`, `order_window.json`
+from the original Telegram bot to be present next to this script (project root).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import uuid
-from datetime import datetime, timedelta
+import sys
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import text, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND_ROOT = ROOT / "backend"
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
 
 from app.core.config import settings
-from app.core.logging import configure_logging
-from app.db import get_session
+from app.db.models.enums import DayOfWeek, OrderStatus, UserRole
 from app.db.models.menu import MenuItem, MenuWeek
 from app.db.models.order import Order
 from app.db.models.order_window import OrderWindow
 from app.db.models.user import User
-from app.domain.menu.service import MenuService
-from app.domain.order_window.service import OrderWindowService
-from app.domain.users.service import UserService
+from app.db.session import async_session_factory, engine
 
-LOGGER = logging.getLogger("migrate")
-DAY_MAPPING = {
-    "Понедельник": "monday",
-    "Вторник": "tuesday",
-    "Среда": "wednesday",
-    "Четверг": "thursday",
-    "Пятница": "friday",
-}
+LEGACY_DIR = Path.cwd()
+USERS_FILE = LEGACY_DIR / "users.json"
+ORDERS_FILE = LEGACY_DIR / "orders.json"
+MENU_FILE = LEGACY_DIR / "menu.json"
+ORDER_WINDOW_FILE = LEGACY_DIR / "order_window.json"
+LOG_PATH = Path("logs/migrate_json_to_db.log")
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-
-async def ensure_journal(session: AsyncSession) -> None:
-    await session.execute(
-        text(
-            """
-            CREATE TABLE IF NOT EXISTS data_migration_runs (
-                run_id UUID PRIMARY KEY,
-                started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                finished_at TIMESTAMPTZ,
-                status TEXT NOT NULL DEFAULT 'running',
-                notes TEXT
-            );
-            """
-        )
-    )
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_PATH, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("migrate-json")
 
 
-async def journal_update(session: AsyncSession, run_id: uuid.UUID, status: str, notes: str | None = None) -> None:
-    await session.execute(
-        text(
-            "UPDATE data_migration_runs SET finished_at = now(), status = :status, notes = :notes WHERE run_id = :run_id"
-        ),
-        {"status": status, "notes": notes, "run_id": str(run_id)},
-    )
-
-
-async def journal_start(session: AsyncSession) -> uuid.UUID:
-    run_id = uuid.uuid4()
-    await session.execute(
-        text("INSERT INTO data_migration_runs(run_id) VALUES (:run_id)"), {"run_id": str(run_id)}
-    )
-    return run_id
-
-
-def load_json(path: Path) -> Any:
-    if not path.exists():
-        LOGGER.warning("File %s not found; skipping", path)
-        return None
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-async def migrate_users(session: AsyncSession, payload: dict[str, Any]) -> None:
-    LOGGER.info("Migrating %s users", len(payload))
-    service = UserService(session)
-    for telegram_id, data in payload.items():
+async def migrate_users(session) -> dict[int, User]:
+    if not USERS_FILE.exists():
+        logger.warning("users.json not found — skipping user migration")
+        return {}
+    data = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+    result: dict[int, User] = {}
+    for key, payload in data.items():
         try:
-            tg_id = int(telegram_id)
+            telegram_id = int(key)
         except ValueError:
-            LOGGER.warning("Invalid telegram id %s; skipping", telegram_id)
+            logger.warning("Skip user with invalid key: %s", key)
             continue
-        email = data.get("email")
-        user = await service.get_by_telegram(tg_id)
-        if user:
-            user.full_name = data.get("name") or user.full_name
-            user.address = data.get("address") or user.address
-            user.phone = data.get("phone") or user.phone
+        stmt = select(User).where(User.telegram_id == telegram_id)
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        address = (payload or {}).get("address")
+        phone = (payload or {}).get("phone")
+        if existing:
+            existing.address = address or existing.address
+            existing.phone = phone or existing.phone
+            result[telegram_id] = existing
+            logger.info("Updated user %s", telegram_id)
         else:
-            user = User(
-                telegram_id=tg_id,
-                email=email,
-                full_name=data.get("name"),
-                address=data.get("address"),
-                phone=data.get("phone"),
-                roles=data.get("roles") or ["customer"],
-            )
-            session.add(user)
-    await session.flush()
-
-
-def _week_start_from_timestamp(ts: int) -> datetime.date:
-    dt = datetime.fromtimestamp(ts)
-    return dt.date() - timedelta(days=dt.weekday())
-
-
-async def migrate_orders(session: AsyncSession, payload: dict[str, Any]) -> None:
-    LOGGER.info("Migrating %s orders", len(payload))
-    for public_id, data in payload.items():
-        status = str(data.get("status") or "new").lower()
-        menu_snapshot = data.get("menu") or []
-        if isinstance(menu_snapshot, str):
-            menu_snapshot = [item.strip() for item in menu_snapshot.split(",") if item.strip()]
-        telegram_id = data.get("user_id")
-        if telegram_id is None:
-            LOGGER.warning("Order %s has no user_id; skipping", public_id)
-            continue
-        user_stmt = select(User).where(User.telegram_id == int(telegram_id))
-        result = await session.execute(user_stmt)
-        user = result.scalars().first()
-        if user is None:
-            user = User(telegram_id=int(telegram_id), roles=["customer"])
+            user = User(telegram_id=telegram_id, address=address, phone=phone, role=UserRole.CUSTOMER)
             session.add(user)
             await session.flush()
-        created_ts = int(data.get("created_at") or 0)
-        delivery_week_start = data.get("delivery_week_start")
+            result[telegram_id] = user
+            logger.info("Inserted user %s", telegram_id)
+    return result
+
+
+def _parse_count(raw: Any) -> int:
+    if isinstance(raw, int):
+        return raw
+    text = str(raw)
+    for token in text.split():
+        if token.isdigit():
+            return int(token)
+    raise ValueError(f"cannot parse count from {raw!r}")
+
+
+def _parse_status(raw: Any) -> OrderStatus:
+    try:
+        return OrderStatus(str(raw))
+    except ValueError:
+        return OrderStatus.NEW
+
+
+def _infer_week_start(day_name: str, created_at: int | None) -> date:
+    if created_at:
+        dt = datetime.fromtimestamp(created_at)
+        monday = dt - timedelta(days=dt.weekday())
+        return monday.date()
+    # fallback to current week start
+    today = datetime.utcnow().date()
+    return today - timedelta(days=today.weekday())
+
+
+async def migrate_orders(session, users_by_telegram: dict[int, User]) -> None:
+    if not ORDERS_FILE.exists():
+        logger.warning("orders.json not found — skipping order migration")
+        return
+    data = json.loads(ORDERS_FILE.read_text(encoding="utf-8"))
+    for order_id, payload in data.items():
+        telegram_id = int(payload.get("user_id", 0))
+        user = users_by_telegram.get(telegram_id)
+        if not user:
+            logger.warning("Skipping order %s: unknown user %s", order_id, telegram_id)
+            continue
+        count = _parse_count(payload.get("count", 1))
+        day_name = str(payload.get("day") or "Понедельник")
+        try:
+            day = DayOfWeek(day_name)
+        except ValueError:
+            logger.warning("Unknown day '%s' for order %s", day_name, order_id)
+            continue
+        created_at = payload.get("created_at")
+        delivery_week_start = payload.get("delivery_week_start")
         if delivery_week_start:
             try:
-                week_start = datetime.fromisoformat(delivery_week_start).date()
+                week_start = date.fromisoformat(str(delivery_week_start))
             except ValueError:
-                week_start = _week_start_from_timestamp(created_ts)
+                week_start = _infer_week_start(day_name, created_at)
         else:
-            week_start = _week_start_from_timestamp(created_ts)
-        day_ru = data.get("day")
-        day = DAY_MAPPING.get(day_ru, str(day_ru).lower())
-        stmt = select(Order).where(Order.public_id == public_id)
-        existing = (await session.execute(stmt)).scalars().first()
+            week_start = _infer_week_start(day_name, created_at)
+        delivery_date = week_start + timedelta(days={
+            DayOfWeek.MONDAY: 0,
+            DayOfWeek.TUESDAY: 1,
+            DayOfWeek.WEDNESDAY: 2,
+            DayOfWeek.THURSDAY: 3,
+            DayOfWeek.FRIDAY: 4,
+        }[day])
+
+        stmt = select(Order).where(Order.id == order_id)
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        menu_items_raw = payload.get("menu")
+        if isinstance(menu_items_raw, list):
+            menu_items = [str(item).strip() for item in menu_items_raw if str(item).strip()]
+        else:
+            menu_items = [part.strip() for part in str(menu_items_raw or "").split(",") if part.strip()]
+        if not menu_items:
+            menu_items = ["Не указано"]
+
+        status = _parse_status(payload.get("status"))
+        address = payload.get("address")
+        phone = payload.get("phone")
+
         if existing:
+            existing.count = count
+            existing.day_of_week = day
+            existing.menu_items = menu_items
             existing.status = status
-            existing.count = int(data.get("count") or existing.count)
-            existing.address_snapshot = data.get("address") or existing.address_snapshot
-            existing.phone_snapshot = data.get("phone") or existing.phone_snapshot
-            existing.menu_snapshot = menu_snapshot or existing.menu_snapshot
+            existing.address = address
+            existing.phone = phone
             existing.delivery_week_start = week_start
-            continue
-        order = Order(
-            public_id=public_id,
-            user_id=user.id,
-            day=day,
-            count=int(data.get("count") or 1),
-            status=status,
-            menu_snapshot=menu_snapshot,
-            address_snapshot=data.get("address"),
-            phone_snapshot=data.get("phone"),
-            delivery_week_start=week_start,
-            is_next_week=bool(data.get("next_week")),
-        )
-        session.add(order)
-    await session.flush()
+            existing.delivery_date = delivery_date
+            logger.info("Updated order %s", order_id)
+        else:
+            order = Order(
+                id=order_id,
+                user_id=user.id,
+                day_of_week=day,
+                count=count,
+                menu_items=menu_items,
+                status=status,
+                address=address,
+                phone=phone,
+                delivery_week_start=week_start,
+                delivery_date=delivery_date,
+                next_week=False,
+                unit_price=settings.order_price_lari,
+            )
+            session.add(order)
+            logger.info("Inserted order %s", order_id)
 
 
-async def migrate_menu(session: AsyncSession, payload: dict[str, Any]) -> None:
-    LOGGER.info("Migrating menu.json")
-    week_label = payload.get("week")
-    try:
-        week_start = datetime.fromisoformat(str(week_label)).date()
-    except ValueError:
-        LOGGER.warning("Invalid week label %s; skipping menu", week_label)
+async def migrate_menu(session) -> None:
+    if not MENU_FILE.exists():
+        logger.warning("menu.json not found — skipping menu migration")
         return
-    menu_service = MenuService(session)
-    week = await menu_service.get_or_create_week(week_start, title=payload.get("title") or f"Menu {week_label}")
-    menu_map = payload.get("menu") or {}
-    for day_ru, items in menu_map.items():
-        normalized_day = DAY_MAPPING.get(day_ru, str(day_ru).lower())
-        structured: list[dict[str, str | None]] = []
-        if isinstance(items, list):
-            structured = [{"title": str(item)} for item in items]
-        elif isinstance(items, str):
-            structured = [{"title": part.strip()} for part in items.split(",") if part.strip()]
-        await menu_service.set_day_items(week, day=normalized_day, items=structured)
-    await session.flush()
-
-
-async def migrate_order_window(session: AsyncSession, payload: dict[str, Any]) -> None:
-    LOGGER.info("Migrating order_window.json")
-    service = OrderWindowService(session)
-    week_start = payload.get("week_start")
-    parsed_week = None
-    if week_start:
+    data = json.loads(MENU_FILE.read_text(encoding="utf-8"))
+    week_label = str(data.get("week") or "Legacy menu")
+    menu_payload = data.get("menu") or {}
+    week_start = None
+    if ORDER_WINDOW_FILE.exists():
         try:
-            parsed_week = datetime.fromisoformat(str(week_start)).date()
+            order_window_data = json.loads(ORDER_WINDOW_FILE.read_text(encoding="utf-8"))
+            if order_window_data.get("week_start"):
+                week_start = date.fromisoformat(order_window_data["week_start"])
+        except Exception:
+            week_start = None
+
+    stmt = select(MenuWeek).where(MenuWeek.week_label == week_label)
+    week = (await session.execute(stmt)).scalar_one_or_none()
+    if not week:
+        week = MenuWeek(week_label=week_label, week_start=week_start)
+        session.add(week)
+        await session.flush()
+        logger.info("Inserted menu week '%s'", week_label)
+    else:
+        week.week_start = week_start or week.week_start
+        logger.info("Updated menu week '%s'", week_label)
+
+    for day_name, items in menu_payload.items():
+        try:
+            day = DayOfWeek(day_name)
         except ValueError:
-            LOGGER.warning("Invalid week_start %s; skipping", week_start)
-    await service.set_window(enabled=bool(payload.get("next_week_enabled")), week_start=parsed_week, note=None)
-    await session.flush()
+            logger.warning("Skip menu day '%s'", day_name)
+            continue
+        normalized = []
+        if isinstance(items, list):
+            normalized = [str(item).strip() for item in items if str(item).strip()]
+        else:
+            normalized = [part.strip() for part in str(items).split(",") if part.strip()]
+        stmt_items = select(MenuItem).where(MenuItem.week_id == week.id, MenuItem.day_of_week == day)
+        existing_items = (await session.execute(stmt_items)).scalars().all()
+        for idx, title in enumerate(normalized):
+            if idx < len(existing_items):
+                existing_items[idx].title = title
+                existing_items[idx].position = idx
+            else:
+                session.add(MenuItem(week_id=week.id, day_of_week=day, title=title, position=idx))
+        for idx in range(len(normalized), len(existing_items)):
+            await session.delete(existing_items[idx])
 
 
-async def migrate_all() -> None:
-    configure_logging()
-    async for session in get_session():
-        await ensure_journal(session)
-        run_id = await journal_start(session)
+async def migrate_order_window(session) -> None:
+    if not ORDER_WINDOW_FILE.exists():
+        logger.warning("order_window.json not found — skipping order window migration")
+        return
+    data = json.loads(ORDER_WINDOW_FILE.read_text(encoding="utf-8"))
+    enabled = bool(data.get("next_week_enabled"))
+    week_start_val = data.get("week_start")
+    week_start = None
+    if week_start_val:
         try:
-            users = load_json(Path("users.json")) or {}
-            if isinstance(users, dict):
-                await migrate_users(session, users)
-            orders = load_json(Path("orders.json")) or {}
-            if isinstance(orders, dict):
-                await migrate_orders(session, orders)
-            menu = load_json(Path("menu.json"))
-            if isinstance(menu, dict):
-                await migrate_menu(session, menu)
-            order_window = load_json(Path("order_window.json")) or {}
-            if isinstance(order_window, dict):
-                await migrate_order_window(session, order_window)
-            await journal_update(session, run_id, "completed")
-            await session.commit()
-        except Exception as exc:  # pragma: no cover - fault path
-            await journal_update(session, run_id, "failed", notes=str(exc))
-            await session.rollback()
-            LOGGER.exception("Migration failed: %s", exc)
-            raise
-        finally:
-            break
+            week_start = date.fromisoformat(str(week_start_val))
+        except ValueError:
+            week_start = None
+    stmt = select(OrderWindow)
+    window = (await session.execute(stmt.limit(1))).scalar_one_or_none()
+    if not window:
+        window = OrderWindow(next_week_enabled=enabled, week_start=week_start)
+        session.add(window)
+        logger.info("Inserted order window state")
+    else:
+        window.next_week_enabled = enabled
+        window.week_start = week_start
+        logger.info("Updated order window state")
+
+
+async def migrate() -> None:
+    async with async_session_factory() as session:
+        users_map = await migrate_users(session)
+        await migrate_menu(session)
+        await migrate_order_window(session)
+        await migrate_orders(session, users_map)
+        await session.commit()
+        logger.info("Migration finished successfully")
 
 
 def main() -> None:
-    asyncio.run(migrate_all())
+    logger.info("Starting migration using database %s", settings.database_url)
+    asyncio.run(migrate())
 
 
 if __name__ == "__main__":

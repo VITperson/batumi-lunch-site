@@ -1,70 +1,52 @@
-"""FastAPI application entrypoint."""
-
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
-from pathlib import Path
-
-from fastapi import Depends, FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
+from redis.asyncio import Redis
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db
-from app.api.v1.endpoints import admin, auth, menu, orders
-from app.core.config import settings
-from app.core.logging import configure_logging, set_trace_id
+from .api.v1.router import router as api_router
+from .core.config import settings
+from .core.logging import configure_logging
+from .db.session import engine
 
 configure_logging()
 
-app = FastAPI(title=settings.app_name, version="0.1.0", openapi_url=f"{settings.api_v1_prefix}/openapi.json")
+_redis_client: Redis | None = Redis.from_url(str(settings.redis_url), decode_responses=True) if settings.redis_url else None
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[settings.frontend_url, "http://localhost:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title=settings.app_name, version="0.1.0")
+app.include_router(api_router)
 
-# Static media (temporary local storage until S3 integration)
-MEDIA_ROOT = Path(__file__).resolve().parents[2] / "storage" / "menu"
-MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
-app.mount("/media/menu", StaticFiles(directory=str(MEDIA_ROOT), check_dir=False), name="menu-media")
-
-
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):  # type: ignore[override]
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    set_trace_id(request_id)
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+if settings.cors_allow_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[str(origin).rstrip("/") for origin in settings.cors_allow_origins],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
-@app.get("/healthz")
+@app.get("/healthz", tags=["monitoring"])
 async def healthz() -> dict[str, str]:
-    return {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+    return {"status": "ok"}
 
 
-@app.get("/readyz")
-async def readyz(session: AsyncSession = Depends(get_db)) -> JSONResponse:
+@app.get("/readyz", tags=["monitoring"])
+async def readyz() -> dict[str, str]:
     try:
-        await session.execute(text("SELECT 1"))
-    except Exception as exc:  # pragma: no cover - readiness path
-        return JSONResponse(status_code=503, content={"status": "error", "detail": str(exc)})
-    return JSONResponse({"status": "ready"})
-
-
-app.include_router(auth.router, prefix=settings.api_v1_prefix)
-app.include_router(menu.router, prefix=settings.api_v1_prefix)
-app.include_router(orders.router, prefix=settings.api_v1_prefix)
-app.include_router(admin.router, prefix=settings.api_v1_prefix)
+        async with engine.begin() as conn:
+            await conn.execute(text("SELECT 1"))
+        if _redis_client:
+            await _redis_client.ping()
+    except Exception:
+        return {"status": "degraded"}
+    return {"status": "ready"}
 
 
 @app.get("/")
 async def root() -> dict[str, str]:
-    return {"message": "Batumi Lunch API", "docs": f"{settings.api_v1_prefix}/docs"}
+    return {"message": "Batumi Lunch API"}
+
+
+__all__ = ["app"]

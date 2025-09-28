@@ -1,13 +1,22 @@
-"""SQLAlchemy declarative base."""
-
 from __future__ import annotations
 
-from sqlalchemy.orm import DeclarativeBase, declared_attr
+from datetime import datetime
+
+from sqlalchemy import DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class Base(DeclarativeBase):
-    """Declarative base that configures automatic table naming."""
+    __abstract__ = True
 
-    @declared_attr.directive
-    def __tablename__(cls) -> str:  # type: ignore[misc]
-        return cls.__name__.lower()
+
+class TimestampMixin:
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+__all__ = ["Base", "TimestampMixin"]

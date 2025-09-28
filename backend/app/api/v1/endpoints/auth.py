@@ -1,83 +1,116 @@
 from __future__ import annotations
 
-import uuid
-
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-
-from app.api.deps import get_current_user, get_db
-from app.api.v1.schemas.auth import AuthResponse, LoginRequest, TokenPair, UserMe
-from app.core.config import settings
-from app.core.security import create_access_token, create_refresh_token, decode_token
-from app.domain.users.service import UserService
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.deps import get_current_user, get_session_dep
+from app.core.security import TokenType, create_access_token, create_refresh_token, decode_token
+from app.db.models.user import User
+from app.domain.users import InvalidCredentialsError, UserAlreadyExistsError, UserService
+
+from ..schemas.auth import (
+    LoginRequest,
+    ProfileResponse,
+    ProfileUpdateRequest,
+    RefreshRequest,
+    RegisterRequest,
+    TokenResponse,
+)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-@router.post("/login", response_model=AuthResponse)
-async def login(request: LoginRequest, response: Response, session: AsyncSession = Depends(get_db)) -> AuthResponse:
-    user_service = UserService(session)
-    user = await user_service.authenticate(request.email, request.password)
+@router.post("/login", response_model=TokenResponse)
+async def login(request: LoginRequest, session: AsyncSession = Depends(get_session_dep)) -> TokenResponse:
+    service = UserService(session)
+    user = await service.authenticate(email=request.email, password=request.password)
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Неверный логин или пароль")
-
-    access = create_access_token(str(user.id), scopes=user.roles or [])
-    refresh = create_refresh_token(str(user.id))
-
-    response.set_cookie(
-        "refresh_token",
-        refresh,
-        httponly=True,
-        secure=settings.environment == "production",
-        samesite="lax",
-        max_age=settings.jwt_refresh_ttl,
+    return TokenResponse(
+        accessToken=create_access_token(str(user.id)),
+        refreshToken=create_refresh_token(str(user.id)),
     )
 
-    return AuthResponse(
-        user_id=user.id,
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(request: RefreshRequest) -> TokenResponse:
+    try:
+        payload = decode_token(request.refreshToken, expected_type=TokenType.REFRESH)
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token") from None
+    subject = payload.get("sub")
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    return TokenResponse(
+        accessToken=create_access_token(subject),
+        refreshToken=create_refresh_token(subject),
+    )
+
+
+def _serialize_user(user: User) -> ProfileResponse:
+    return ProfileResponse(
+        id=str(user.id),
         email=user.email,
-        roles=user.roles or [],
-        access=TokenPair(access_token=access, expires_in=settings.jwt_access_ttl),
-    )
-
-
-@router.post("/refresh", response_model=AuthResponse)
-async def refresh_token(request: Request, response: Response, session: AsyncSession = Depends(get_db)) -> AuthResponse:
-    token = request.cookies.get("refresh_token")
-    if token is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh токен отсутствует")
-    payload = decode_token(token)
-    if payload.type != "refresh":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Некорректный refresh токен")
-    user = await UserService(session).get_by_id(uuid.UUID(payload.sub))
-    if not user:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь не найден")
-    access = create_access_token(str(user.id), scopes=user.roles or [])
-    new_refresh = create_refresh_token(str(user.id))
-    response.set_cookie(
-        "refresh_token",
-        new_refresh,
-        httponly=True,
-        secure=settings.environment == "production",
-        samesite="lax",
-        max_age=settings.jwt_refresh_ttl,
-    )
-    return AuthResponse(
-        user_id=user.id,
-        email=user.email,
-        roles=user.roles or [],
-        access=TokenPair(access_token=access, expires_in=settings.jwt_access_ttl),
-    )
-
-
-@router.get("/me", response_model=UserMe)
-async def me(user = Depends(get_current_user)) -> UserMe:  # type: ignore[no-untyped-def]
-    return UserMe(
-        id=user.id,
-        email=user.email,
-        full_name=user.full_name,
-        roles=user.roles or [],
-        address=user.address,
+        fullName=user.full_name,
         phone=user.phone,
-        created_at=user.created_at,
+        address=user.address,
+        role=user.role.value,
     )
+
+
+@router.get("/me", response_model=ProfileResponse)
+async def me(current_user: User = Depends(get_current_user)) -> ProfileResponse:
+    return _serialize_user(current_user)
+
+
+@router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
+async def register(request: RegisterRequest, session: AsyncSession = Depends(get_session_dep)) -> TokenResponse:
+    service = UserService(session)
+    try:
+        user = await service.create_user(
+            email=request.email,
+            password=request.password,
+            full_name=request.fullName,
+            phone=request.phone,
+            address=request.address,
+        )
+    except UserAlreadyExistsError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email уже зарегистрирован") from None
+
+    return TokenResponse(
+        accessToken=create_access_token(str(user.id)),
+        refreshToken=create_refresh_token(str(user.id)),
+    )
+
+
+@router.patch("/me", response_model=ProfileResponse)
+async def update_profile(
+    request: ProfileUpdateRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session_dep),
+) -> ProfileResponse:
+    service = UserService(session)
+
+    if request.newPassword:
+        if not request.currentPassword:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Укажите текущий пароль для смены пароля",
+            )
+        try:
+            await service.change_password(
+                current_user,
+                current_password=request.currentPassword,
+                new_password=request.newPassword,
+            )
+        except InvalidCredentialsError:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Неверный текущий пароль") from None
+
+    await service.update_profile(
+        current_user,
+        full_name=request.fullName,
+        phone=request.phone,
+        address=request.address,
+    )
+
+    return _serialize_user(current_user)

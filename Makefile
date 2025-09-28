@@ -1,40 +1,45 @@
-.PHONY: install migrate seed serve-api serve-web test lint up down format generate-openapi
+PYTHON ?= python3
+PIP ?= $(PYTHON) -m pip
+NPM ?= npm
+DOCKER_COMPOSE ?= docker compose
+ALEMBIC ?= alembic
 
-install:
-	cd backend && poetry install
-	npm install --prefix frontend
+.PHONY: install install-backend install-frontend migrate seed serve-api serve-web test lint up down fmt openapi
+
+install: install-backend install-frontend
+
+install-backend:
+	$(PIP) install -e backend[dev]
+
+install-frontend:
+	cd frontend && $(NPM) install
 
 migrate:
-	cd backend && poetry run alembic upgrade head
+	cd backend && $(ALEMBIC) -c ../deploy/alembic.ini upgrade head
 
 seed:
-	cd backend && poetry run python ../scripts/seed_menu.py
+	$(PYTHON) scripts/seed_menu.py
 
 serve-api:
-	cd backend && poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+	cd backend && uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 serve-web:
-	npm run dev --prefix frontend
+	cd frontend && $(NPM) run dev
 
 test:
-	cd backend && poetry run pytest
-	npm test --prefix frontend || true
+	cd backend && pytest
 
 lint:
-	cd backend && poetry run ruff check app
-	cd backend && poetry run mypy app
-	npm run lint --prefix frontend
+	cd backend && ruff check app && mypy app
+
+fmt:
+	cd backend && ruff format app
+
+openapi:
+	cd backend && python -m app.tools.generate_openapi
 
 up:
-	cd deploy && docker compose up -d --build
+	$(DOCKER_COMPOSE) -f deploy/docker-compose.yml up -d --build
 
 down:
-	cd deploy && docker compose down
-
-format:
-	cd backend && poetry run ruff format app
-	cd backend && poetry run black app
-	npm run lint --prefix frontend -- --fix
-
-generate-openapi:
-	cd backend && poetry run python -m app.tools.generate_openapi
+	$(DOCKER_COMPOSE) -f deploy/docker-compose.yml down -v

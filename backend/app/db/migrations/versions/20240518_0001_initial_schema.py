@@ -1,135 +1,167 @@
-"""Initial database schema."""
+"""Initial schema
+
+Revision ID: 20240518_0001
+Revises:
+Create Date: 2024-05-18
+"""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
+
+USER_ROLE_VALUES = ("customer", "admin")
+DAY_OF_WEEK_VALUES = ("Понедельник", "Вторник", "Среда", "Четверг", "Пятница")
+MENU_DAY_VALUES = DAY_OF_WEEK_VALUES
+ORDER_STATUS_VALUES = ("new", "confirmed", "delivered", "cancelled", "cancelled_by_user")
+BROADCAST_STATUS_VALUES = ("pending", "running", "completed", "failed")
 
 revision = "20240518_0001"
 down_revision = None
-branch_labels: Sequence[str] | None = None
-depends_on: Sequence[str] | None = None
+branch_labels = None
+depends_on = None
+
+
+user_role_enum = postgresql.ENUM(*USER_ROLE_VALUES, name="user_role", create_type=False)
+day_of_week_enum = postgresql.ENUM(*DAY_OF_WEEK_VALUES, name="day_of_week", create_type=False)
+menu_day_enum = postgresql.ENUM(*MENU_DAY_VALUES, name="menu_day_of_week", create_type=False)
+order_status_enum = postgresql.ENUM(*ORDER_STATUS_VALUES, name="order_status", create_type=False)
+broadcast_status_enum = postgresql.ENUM(*BROADCAST_STATUS_VALUES, name="broadcast_status", create_type=False)
+
+
+def _create_enum_type(name: str, values: tuple[str, ...]) -> None:
+    literals = ", ".join(f"'{value}'" for value in values)
+    op.execute(
+        sa.text(
+            f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = '{name}') THEN
+                    CREATE TYPE {name} AS ENUM ({literals});
+                END IF;
+            END
+            $$;
+            """
+        )
+    )
 
 
 def upgrade() -> None:
+    _create_enum_type("user_role", USER_ROLE_VALUES)
+    _create_enum_type("day_of_week", DAY_OF_WEEK_VALUES)
+    _create_enum_type("menu_day_of_week", MENU_DAY_VALUES)
+    _create_enum_type("order_status", ORDER_STATUS_VALUES)
+    _create_enum_type("broadcast_status", BROADCAST_STATUS_VALUES)
+
     op.create_table(
-        "user",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("email", sa.String(length=255), nullable=True),
-        sa.Column("password_hash", sa.String(length=255), nullable=True),
-        sa.Column("telegram_id", sa.BigInteger(), nullable=True),
-        sa.Column("full_name", sa.String(length=255), nullable=True),
-        sa.Column("address", sa.Text(), nullable=True),
+        "users",
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("email", sa.String(length=255), nullable=True, unique=True),
         sa.Column("phone", sa.String(length=32), nullable=True),
-        sa.Column(
-            "roles",
-            sa.JSON(),
-            nullable=False,
-            server_default=sa.text('\"[\\"customer\\"]\"'),
-        ),
-        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("email"),
-        sa.UniqueConstraint("telegram_id"),
+        sa.Column("address", sa.Text(), nullable=True),
+        sa.Column("full_name", sa.String(length=255), nullable=True),
+        sa.Column("telegram_id", sa.BigInteger(), nullable=True, unique=True),
+        sa.Column("role", user_role_enum, nullable=False, server_default="customer"),
+        sa.Column("password_hash", sa.String(length=255), nullable=True),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True),
     )
-    op.create_index(op.f("ix_user_email"), "user", ["email"], unique=False)
-    op.create_index(op.f("ix_user_telegram_id"), "user", ["telegram_id"], unique=False)
 
     op.create_table(
-        "menuweek",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("week_start", sa.Date(), nullable=False),
-        sa.Column("title", sa.String(length=255), nullable=False),
-        sa.Column("hero_image_url", sa.String(length=512), nullable=True),
-        sa.Column("is_published", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.UniqueConstraint("week_start"),
+        "menu_weeks",
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("week_label", sa.String(length=128), nullable=False),
+        sa.Column("week_start", sa.Date(), nullable=True, unique=True),
+        sa.Column("is_current", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("day_photos", sa.JSON(), nullable=True),
     )
-    op.create_index(op.f("ix_menuweek_week_start"), "menuweek", ["week_start"], unique=False)
 
     op.create_table(
-        "orderwindow",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
+        "order_windows",
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("next_week_enabled", sa.Boolean(), nullable=False, server_default=sa.text("false")),
         sa.Column("week_start", sa.Date(), nullable=True),
-        sa.Column("is_enabled", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("note", sa.String(length=255), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
     )
 
     op.create_table(
-        "menuitem",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("menu_week_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("day", sa.String(length=16), nullable=False),
-        sa.Column("position", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        "menu_items",
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("week_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("day_of_week", menu_day_enum, nullable=False),
         sa.Column("title", sa.String(length=255), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("photo_url", sa.String(length=512), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["menu_week_id"], ["menuweek.id"], ondelete="CASCADE"),
+        sa.Column("position", sa.Integer(), nullable=False, server_default="0"),
+        sa.ForeignKeyConstraint(["week_id"], ["menu_weeks.id"], ondelete="CASCADE"),
     )
-    op.create_index("ix_menu_items_week_day_position", "menuitem", ["menu_week_id", "day", "position"], unique=False)
+    op.create_index(op.f("ix_menu_items_day_of_week"), "menu_items", ["day_of_week"], unique=False)
+    op.create_index(op.f("ix_menu_items_week_id"), "menu_items", ["week_id"], unique=False)
 
     op.create_table(
-        "broadcast",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("author_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("channels", sa.JSON(), nullable=False, server_default=sa.text('\"[]\"')),
-        sa.Column("subject", sa.String(length=255), nullable=True),
-        sa.Column("html_body", sa.Text(), nullable=False),
-        sa.Column("status", sa.String(length=32), nullable=False, server_default="pending"),
-        sa.Column("sent", sa.Integer(), nullable=False, server_default=sa.text("0")),
-        sa.Column("failed", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        "broadcasts",
+        sa.Column("id", sa.dialects.postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("channels", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
+        sa.Column("html", sa.Text(), nullable=False),
+        sa.Column("status", broadcast_status_enum, nullable=False, server_default="pending"),
         sa.Column("sent_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.ForeignKeyConstraint(["author_id"], ["user.id"], ondelete="SET NULL"),
+        sa.Column("failed_reason", sa.Text(), nullable=True),
     )
 
     op.create_table(
-        "order",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True, nullable=False),
-        sa.Column("public_id", sa.String(length=32), nullable=False),
-        sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=False),
-        sa.Column("menu_week_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("day", sa.String(length=16), nullable=False),
-        sa.Column("count", sa.Integer(), nullable=False, server_default=sa.text("1")),
-        sa.Column("status", sa.String(length=32), nullable=False, server_default="new"),
-        sa.Column("menu_snapshot", sa.JSON(), nullable=True),
-        sa.Column("address_snapshot", sa.Text(), nullable=True),
-        sa.Column("phone_snapshot", sa.String(length=32), nullable=True),
+        "orders",
+        sa.Column("id", sa.String(length=32), primary_key=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.Column("user_id", sa.dialects.postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("day_of_week", day_of_week_enum, nullable=False),
+        sa.Column("count", sa.Integer(), nullable=False, server_default="1"),
+        sa.Column("menu_items", sa.JSON(), nullable=False, server_default=sa.text("'[]'::json")),
+        sa.Column("status", order_status_enum, nullable=False, server_default="new"),
+        sa.Column("address", sa.Text(), nullable=True),
+        sa.Column("phone", sa.String(length=32), nullable=True),
         sa.Column("delivery_week_start", sa.Date(), nullable=False),
-        sa.Column("is_next_week", sa.Boolean(), nullable=False, server_default=sa.false()),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("cancelled_at", sa.DateTime(timezone=True), nullable=True),
-        sa.ForeignKeyConstraint(["menu_week_id"], ["menuweek.id"], ondelete="SET NULL"),
-        sa.ForeignKeyConstraint(["user_id"], ["user.id"], ondelete="CASCADE"),
-        sa.UniqueConstraint("public_id"),
+        sa.Column("delivery_date", sa.Date(), nullable=False),
+        sa.Column("next_week", sa.Boolean(), nullable=False, server_default=sa.text("false")),
+        sa.Column("unit_price", sa.Integer(), nullable=False, server_default="15"),
+        sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
     )
-    op.create_index(op.f("ix_order_public_id"), "order", ["public_id"], unique=False)
-    op.create_index("ix_orders_week_status", "order", ["delivery_week_start", "status"], unique=False)
-    op.create_index("ix_orders_user_day_week", "order", ["user_id", "day", "delivery_week_start"], unique=False)
+    op.create_index(op.f("ix_orders_day_of_week"), "orders", ["day_of_week"], unique=False)
+    op.create_index(op.f("ix_orders_delivery_date"), "orders", ["delivery_date"], unique=False)
+    op.create_index(op.f("ix_orders_delivery_week_start"), "orders", ["delivery_week_start"], unique=False)
+    op.create_index(op.f("ix_orders_status"), "orders", ["status"], unique=False)
+    op.create_index(op.f("ix_orders_user_id"), "orders", ["user_id"], unique=False)
 
 
 def downgrade() -> None:
-    op.drop_index("ix_orders_user_day_week", table_name="order")
-    op.drop_index("ix_orders_week_status", table_name="order")
-    op.drop_index(op.f("ix_order_public_id"), table_name="order")
-    op.drop_table("order")
-    op.drop_table("broadcast")
-    op.drop_index("ix_menu_items_week_day_position", table_name="menuitem")
-    op.drop_table("menuitem")
-    op.drop_table("orderwindow")
-    op.drop_index(op.f("ix_menuweek_week_start"), table_name="menuweek")
-    op.drop_table("menuweek")
-    op.drop_index(op.f("ix_user_telegram_id"), table_name="user")
-    op.drop_index(op.f("ix_user_email"), table_name="user")
-    op.drop_table("user")
+    op.drop_index(op.f("ix_orders_user_id"), table_name="orders")
+    op.drop_index(op.f("ix_orders_status"), table_name="orders")
+    op.drop_index(op.f("ix_orders_delivery_week_start"), table_name="orders")
+    op.drop_index(op.f("ix_orders_delivery_date"), table_name="orders")
+    op.drop_index(op.f("ix_orders_day_of_week"), table_name="orders")
+    op.drop_table("orders")
+
+    op.drop_table("broadcasts")
+
+    op.drop_index(op.f("ix_menu_items_week_id"), table_name="menu_items")
+    op.drop_index(op.f("ix_menu_items_day_of_week"), table_name="menu_items")
+    op.drop_table("menu_items")
+
+    op.drop_table("order_windows")
+    op.drop_table("menu_weeks")
+    op.drop_table("users")
+
+    op.execute(sa.text("DROP TYPE IF EXISTS broadcast_status"))
+    op.execute(sa.text("DROP TYPE IF EXISTS order_status"))
+    op.execute(sa.text("DROP TYPE IF EXISTS menu_day_of_week"))
+    op.execute(sa.text("DROP TYPE IF EXISTS day_of_week"))
+    op.execute(sa.text("DROP TYPE IF EXISTS user_role"))

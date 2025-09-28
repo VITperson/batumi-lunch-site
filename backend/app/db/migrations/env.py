@@ -1,5 +1,3 @@
-"""Alembic environment configuration."""
-
 from __future__ import annotations
 
 import asyncio
@@ -13,21 +11,23 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from app.core.config import settings
 from app.db.base import Base
 
+# this is the Alembic Config object, which provides
+# access to the values within the .ini file in use.
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# target_metadata is required for 'autogenerate' support.
+
+def _get_url() -> str:
+    return str(settings.database_url or "sqlite+aiosqlite:///./batumi_lunch.db")
+
+
 target_metadata = Base.metadata
 
 
-def get_url() -> str:
-    return settings.database_url_async
-
-
 def run_migrations_offline() -> None:
-    url = settings.database_url_sync
+    url = _get_url()
     context.configure(
         url=url,
         target_metadata=target_metadata,
@@ -46,21 +46,18 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_migrations_online() -> None:
-    connectable = create_async_engine(get_url(), poolclass=pool.NullPool)
+def run_migrations_online() -> None:
+    url = _get_url()
+    connectable: AsyncEngine = create_async_engine(url, poolclass=pool.NullPool)
 
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
+    async def _run() -> None:
+        async with connectable.connect() as connection:
+            await connection.run_sync(do_run_migrations)
 
-    await connectable.dispose()
-
-
-def main() -> None:
-    if context.is_offline_mode():
-        run_migrations_offline()
-    else:
-        asyncio.run(run_migrations_online())
+    asyncio.run(_run())
 
 
-if __name__ == "__main__":
-    main()
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()

@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 from datetime import datetime
-from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
 class BroadcastRequest(BaseModel):
-    channels: list[str] = Field(default_factory=lambda: ["email"])
-    subject: str | None = None
-    html: str = Field(..., min_length=1)
+    channels: list[str] = Field(default_factory=list)
+    html: str
 
 
 class BroadcastResponse(BaseModel):
-    id: UUID
+    id: str
     status: str
-    sent: int
-    failed: int
-    created_at: datetime
+    sentAt: datetime | None
+
+
+__all__ = ["BroadcastRequest", "BroadcastResponse"]

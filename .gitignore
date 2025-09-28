@@ -1,42 +1,59 @@
 # Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.log
 venv/
 .venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 .env
+*.egg-info/
 
-# Poetry
-poetry.lock
+
+# Secrets and sensitive files
+*.env*
+*.secret
+*.token
+*.pem
+*.crt
+*.key
+*.p12
+*.pfx
+*.cer
+*.der
+*.jks
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+backend/batumi_lunch.db
 
 # Node
-node_modules/
-.next/
-out/
-frontend/.next/
 frontend/node_modules/
+frontend/.next/
+frontend/out/
 
-# IDE
+.next/
+
+# Editor
 .idea/
 .vscode/
 .DS_Store
 
-# State
-*.sqlite3
-logs/
+# Coverage / reports
 
-# Coverage
+.coverage
 htmlcov/
-.coverage*
+pytest_cache/
 
+
+.mypy_cache/
+.pytest_cache/
+.cache/
+.sass-cache/
+.parcel-cache/
+.turbo/
+.vercel/
+logs/
 # Docker
-*.pid
-
-# Cypress
-frontend/cypress/videos/
-frontend/cypress/screenshots/
-
-# Local storage
-storage/
+*.log

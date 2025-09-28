@@ -1,0 +1,178 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: light;
+    --color-bg: #fffdf8;
+    --color-surface: #ffffff;
+    --color-surface-elevated: #ffffff;
+    --color-text-primary: #1b1b1b;
+    --color-text-secondary: #4b4b4b;
+    --color-border: #e9e4da;
+    --color-primary: #c63d2f;
+    --color-primary-hover: #b33422;
+    --color-on-primary: #ffffff;
+    --color-secondary: #2e7d32;
+    --color-secondary-hover: #2c6f2f;
+    --color-info: #0f766e;
+    --color-badge: #f2c94c;
+    --color-chip: #fff1d6;
+    --color-success: #2e7d32;
+    --color-warning: #d97706;
+    --color-error: #b4231f;
+    --color-info-soft: #0f766e;
+  }
+
+  :root.dark {
+    color-scheme: dark;
+    --color-bg: #121212;
+    --color-surface: #1a1a1a;
+    --color-surface-elevated: #222222;
+    --color-text-primary: #ffffff;
+    --color-text-secondary: #d1d1d1;
+    --color-border: #2a2a2a;
+    --color-primary: #c63d2f;
+    --color-primary-hover: #b33422;
+    --color-on-primary: #ffffff;
+    --color-secondary: #2e7d32;
+    --color-secondary-hover: #2c6f2f;
+    --color-info: #22b8b5;
+    --color-badge: #f2c94c;
+    --color-chip: #3a2a1e;
+    --color-success: #2e7d32;
+    --color-warning: #d97706;
+    --color-error: #ef4444;
+    --color-info-soft: #22b8b5;
+  }
+
+  body {
+    margin: 0;
+    min-height: 100vh;
+    font-family: "Inter", sans-serif;
+    background-color: var(--color-bg);
+    color: var(--color-text-primary);
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--color-primary) 25%, transparent);
+    color: var(--color-on-primary);
+  }
+}
+
+@layer components {
+  .btn-primary {
+    @apply inline-flex items-center justify-center rounded-full px-5 py-2 text-sm font-semibold shadow-lg transition focus:outline-none focus-visible:ring-2;
+    background: var(--color-primary);
+    color: var(--color-on-primary);
+    border: 1px solid color-mix(in srgb, var(--color-primary) 65%, #000 5%);
+    box-shadow: 0 12px 32px -14px rgba(198, 61, 47, 0.55);
+  }
+
+  .btn-primary:hover {
+    background: var(--color-primary-hover);
+  }
+
+  .btn-primary:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-primary) 30%, transparent);
+  }
+
+  .btn-secondary {
+    @apply inline-flex items-center justify-center rounded-full px-5 py-2 text-sm font-semibold shadow-sm transition focus:outline-none focus-visible:ring-2;
+    background: var(--color-surface);
+    color: var(--color-secondary);
+    border: 1px solid color-mix(in srgb, var(--color-secondary) 35%, var(--color-border) 65%);
+  }
+
+  .btn-secondary:hover {
+    background: color-mix(in srgb, var(--color-chip) 50%, var(--color-surface) 50%);
+    color: var(--color-secondary-hover);
+    border-color: var(--color-secondary-hover);
+  }
+
+  .btn-secondary:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-secondary) 25%, transparent);
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center justify-center rounded-full px-4 py-2 text-sm font-medium transition focus:outline-none focus-visible:ring-2;
+    color: var(--color-text-secondary);
+  }
+
+  .btn-ghost:hover {
+    background: color-mix(in srgb, var(--color-chip) 35%, transparent);
+  }
+
+  .btn-ghost:focus-visible {
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-border) 50%, transparent);
+  }
+
+  .card {
+    border-radius: 1.75rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 80%, transparent);
+    background: color-mix(in srgb, var(--color-surface) 90%, rgba(255, 255, 255, 0.88));
+    box-shadow: 0 28px 60px -35px rgba(27, 27, 27, 0.55);
+    backdrop-filter: blur(18px);
+  }
+
+  .dark .card {
+    background: color-mix(in srgb, var(--color-surface) 90%, rgba(18, 18, 18, 0.9));
+    box-shadow: 0 35px 70px -40px rgba(0, 0, 0, 0.75);
+  }
+
+  .eyebrow {
+    @apply inline-flex items-center gap-2 rounded-full border px-4 py-1 text-xs font-semibold uppercase tracking-[0.2em];
+    border-color: color-mix(in srgb, var(--color-secondary) 25%, var(--color-border) 75%);
+    background: color-mix(in srgb, var(--color-chip) 70%, var(--color-surface) 30%);
+    color: var(--color-secondary);
+  }
+
+  .surface-muted {
+    border-radius: 1.25rem;
+    border: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+    background: color-mix(in srgb, var(--color-surface) 85%, rgba(255, 241, 214, 0.45));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    backdrop-filter: blur(14px);
+  }
+
+  a {
+    color: var(--color-info);
+    transition: color 0.2s ease;
+  }
+
+  a:hover {
+    color: color-mix(in srgb, var(--color-info) 80%, var(--color-secondary) 20%);
+  }
+}
+
+@layer utilities {
+  .text-primary {
+    color: var(--color-text-primary) !important;
+  }
+
+  .text-secondary {
+    color: var(--color-text-secondary) !important;
+  }
+
+  .bg-surface {
+    background-color: var(--color-surface) !important;
+  }
+
+  .bg-surface-elevated {
+    background-color: var(--color-surface-elevated) !important;
+  }
+
+  .border-outline {
+    border-color: var(--color-border) !important;
+  }
+
+  .text-on-primary {
+    color: var(--color-on-primary) !important;
+  }
+
+  .text-info {
+    color: var(--color-info) !important;
+  }
+}

@@ -1,217 +1,592 @@
-"""Order domain service implementing business rules from the bot."""
-
 from __future__ import annotations
 
 import secrets
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Iterable
+from datetime import date, timedelta
 
-from sqlalchemy import and_, select, update
+from redis.asyncio import Redis
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
+from app.db.models.enums import DayOfferStatus, DayOfWeek, OrderStatus, UserRole
+from app.db.models.menu import DayOffer, MenuItem, MenuWeek
 from app.db.models.order import Order
 from app.db.models.user import User
-from app.domain.menu.service import MenuService
-from app.domain.order_window.service import OrderWindowService
-from .errors import DuplicateOrderError, OrderNotFoundError, OrderValidationError, OrderWindowClosedError
 
-ACTIVE_STATUSES = {"new", "confirmed"}
-ALLOWED_COUNTS = {1, 2, 3, 4}
-DAY_MAPPING = {
-    "понедельник": "monday",
-    "monday": "monday",
-    "вторник": "tuesday",
-    "tuesday": "tuesday",
-    "среда": "wednesday",
-    "wednesday": "wednesday",
-    "четверг": "thursday",
-    "thursday": "thursday",
-    "пятница": "friday",
-    "friday": "friday",
-}
+from ..menu import MenuService
+from ..order_window import DayAvailability, OrderWindowService
+from .errors import (
+    DuplicateOrderError,
+    ForbiddenOrderActionError,
+    OrderNotFoundError,
+    OrderWindowClosedError,
+    ValidationError,
+)
+
+_ACTIVE_STATUSES = {OrderStatus.NEW, OrderStatus.CONFIRMED}
 
 
 @dataclass(slots=True)
-class OrderCreateData:
-    day: str
+class OrderDraft:
+    day: DayOfWeek
     count: int
     address: str
     phone: str | None
-    week_start: date | None = None
+
+
+@dataclass(slots=True)
+class PlannerSelection:
+    offer_id: uuid.UUID
+    portions: int
+
+
+@dataclass(slots=True)
+class PlannerWeekRequest:
+    week_start: date | None
+    selections: list[PlannerSelection]
+    enabled: bool = True
+
+
+@dataclass(slots=True)
+class PlannerWeekQuote:
+    week_start: date | None
+    week_label: str | None
+    enabled: bool
+    menu_status: str
+    items: list[PlannerLine]
+    subtotal: int
+    currency: str | None
+    warnings: list[str]
+
+
+@dataclass(slots=True)
+class PlannerLine:
+    offer_id: uuid.UUID
+    day: str
+    status: str
+    requested_portions: int
+    accepted_portions: int
+    unit_price: int
+    currency: str
+    subtotal: int
+    message: str | None
+
+
+@dataclass(slots=True)
+class PlannerQuote:
+    items: list[PlannerLine]
+    subtotal: int
+    discount: int
+    total: int
+    currency: str
+    warnings: list[str]
+    promo_code: str | None
+    promo_code_error: str | None
+    delivery_zone: str | None
+    delivery_available: bool
+    weeks: list[PlannerWeekQuote]
+
+
+_PROMO_CODES: dict[str, dict[str, int | str]] = {
+    "WELCOME10": {"type": "percent", "value": 10, "min_subtotal": 3000},
+    "TRYWEEK": {"type": "flat", "value": 1500, "min_subtotal": 1500},
+}
+
+_DELIVERY_ZONES: dict[str, tuple[str, ...]] = {
+    "batumi-center": (
+        "батум",
+        "batumi",
+        "чавчавадзе",
+        "гогебашвили",
+        "чкхетидзе",
+        "гурам",
+        "old boulevard",
+    ),
+    "new-boulevard": (
+        "агмашенебели",
+        "бульвар",
+        "alliance",
+        "orbi",
+        "sunny beach",
+    ),
+}
 
 
 class OrderService:
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        *,
+        menu_service: MenuService,
+        window_service: OrderWindowService,
+        redis: Redis | None = None,
+    ) -> None:
         self.session = session
-        self.menu_service = MenuService(session)
-        self.window_service = OrderWindowService(session)
+        self.menu_service = menu_service
+        self.window_service = window_service
+        self.redis = redis
 
-    async def create(self, user: User, data: OrderCreateData) -> Order:
-        normalized_day = self._normalize_day(data.day)
-        if data.count not in ALLOWED_COUNTS:
-            raise OrderValidationError("count", "Количество обедов должно быть от 1 до 4.")
-        if not data.address.strip():
-            raise OrderValidationError("address", "Адрес доставки обязателен.")
-
-        decision = await self.window_service.determine(normalized_day)
-        if not decision.allowed:
-            raise OrderWindowClosedError(day=normalized_day, message=decision.reason or "Приём заказов закрыт.")
-
-        delivery_week = decision.week_start
-
-        existing = await self._find_active_duplicate(user.id, normalized_day, delivery_week)
-        if existing:
-            raise DuplicateOrderError(
-                existing_order_id=existing.public_id,
-                day=normalized_day,
-                week_start=delivery_week.isoformat(),
+    async def _rate_limit(self, *, user: User) -> None:
+        if not self.redis:
+            return
+        key = f"{settings.orders_rate_limit_redis_key_prefix}:{user.id}"
+        ttl = await self.redis.ttl(key)
+        if ttl and ttl > 0:
+            raise ValidationError(
+                field="rate_limit",
+                message="Слишком часто: подождите перед следующим заказом",
             )
+        await self.redis.set(key, "1", ex=settings.order_rate_limit_window_seconds)
 
-        menu_week, items_by_day = await self.menu_service.list_week_menu(delivery_week)
-        if not menu_week:
-            raise OrderValidationError("menu", "Меню для выбранной недели не опубликовано.")
-        menu_items = items_by_day.get(normalized_day, [])
-        if not menu_items:
-            raise OrderValidationError("menu", "Меню для выбранного дня отсутствует.")
+    async def _ensure_menu(self, *, day: DayOfWeek, target_week_start: date) -> tuple[MenuWeek, list[str]]:
+        week = await self.menu_service.get_week(week_start=target_week_start, fallback=False)
+        if not week:
+            raise ValidationError(field="day", message="Меню для выбранной недели не опубликовано")
 
-        public_id = self._generate_public_id(user.telegram_id or user.email or str(user.id))
-        order = Order(
-            public_id=public_id,
-            user_id=user.id,
-            menu_week_id=menu_week.id,
-            day=normalized_day,
-            count=data.count,
-            status="new",
-            menu_snapshot=[item.title for item in menu_items],
-            address_snapshot=data.address,
-            phone_snapshot=data.phone,
-            delivery_week_start=delivery_week,
-            is_next_week=decision.is_next_week,
+        stmt = (
+            select(MenuItem)
+            .where(and_(MenuItem.week_id == week.id, MenuItem.day_of_week == day))
+            .order_by(MenuItem.position)
         )
-        self.session.add(order)
-        # update user profile snapshot for address/phone if missing or changed
-        changed = False
-        if (user.address or "").strip() != data.address.strip():
-            user.address = data.address.strip()
-            changed = True
-        if data.phone and (user.phone or "").strip() != data.phone.strip():
-            user.phone = data.phone.strip()
-            changed = True
-        if changed:
-            await self.session.flush()
-        await self.session.flush()
-        return order
+        rows = await self.session.execute(stmt)
+        items = [row.title for row in rows.scalars()]
+        if not items:
+            raise ValidationError(field="day", message="Меню на выбранный день не заполнено")
+        return week, items
 
-    async def _find_active_duplicate(self, user_id: uuid.UUID, day: str, week_start: date) -> Order | None:
+    async def _find_duplicate(self, *, user: User, day: DayOfWeek, target_week_start: date) -> Order | None:
         stmt = (
             select(Order)
             .where(
                 and_(
-                    Order.user_id == user_id,
-                    Order.day == day,
-                    Order.delivery_week_start == week_start,
-                    Order.status.in_(list(ACTIVE_STATUSES)),
+                    Order.user_id == user.id,
+                    Order.day_of_week == day,
+                    Order.delivery_week_start == target_week_start,
+                    Order.status.in_(list(_ACTIVE_STATUSES)),
                 )
             )
             .order_by(Order.created_at.desc())
         )
         result = await self.session.execute(stmt)
-        return result.scalars().first()
+        return result.scalar_one_or_none()
 
-    async def update(self, user: User, public_id: str, *, count: int | None = None, address: str | None = None) -> Order:
-        order = await self.get_by_public_id(public_id)
-        if order.user_id != user.id and "admin" not in (user.roles or []):
-            raise OrderValidationError("permissions", "Редактирование разрешено только владельцу или администратору.")
-        if order.status not in ACTIVE_STATUSES:
-            raise OrderValidationError("status", "Заказ уже обработан и не может быть изменён.")
-        if count is not None:
-            if count not in ALLOWED_COUNTS:
-                raise OrderValidationError("count", "Количество обедов должно быть от 1 до 4.")
-            order.count = count
-        if address:
-            order.address_snapshot = address.strip()
-            if order.user_id == user.id:
-                user.address = order.address_snapshot
-        if count is None and address is None:
-            raise OrderValidationError("payload", "Не переданы данные для обновления.")
+    async def create_order(self, *, user: User, draft: OrderDraft) -> Order:
+        if draft.count < 1 or draft.count > settings.order_daily_limit:
+            raise ValidationError(
+                field="count",
+                message=f"Количество должно быть от 1 до {settings.order_daily_limit}",
+            )
+        if not draft.address.strip():
+            raise ValidationError(field="address", message="Адрес доставки обязателен")
+
+        await self._rate_limit(user=user)
+
+        availability: DayAvailability = await self.window_service.evaluate_day(draft.day.value)
+        if not availability.allowed:
+            raise OrderWindowClosedError(availability.warning or "День недоступен")
+
+        _, menu_items = await self._ensure_menu(day=draft.day, target_week_start=availability.target_week_start)
+
+        duplicate = await self._find_duplicate(user=user, day=draft.day, target_week_start=availability.target_week_start)
+        if duplicate:
+            raise DuplicateOrderError(
+                existing_order_id=duplicate.id,
+                existing_count=duplicate.count,
+                day=draft.day.value,
+            )
+
+        delivery_date = availability.target_week_start + timedelta(days=_day_offset(draft.day))
+        order = Order(
+            id=_generate_order_id(user.id),
+            user_id=user.id,
+            day_of_week=draft.day,
+            count=draft.count,
+            menu_items=menu_items,
+            status=OrderStatus.NEW,
+            address=draft.address.strip(),
+            phone=draft.phone,
+            delivery_week_start=availability.target_week_start,
+            delivery_date=delivery_date,
+            next_week=availability.is_next_week,
+            unit_price=settings.order_price_lari,
+        )
+        self.session.add(order)
         await self.session.flush()
         return order
 
-    async def cancel(self, user: User, public_id: str, *, admin_override: bool = False) -> Order:
-        order = await self.get_by_public_id(public_id)
-        is_owner = order.user_id == user.id
-        is_admin = "admin" in (user.roles or []) or admin_override
-        if not (is_owner or is_admin):
-            raise OrderValidationError("permissions", "Отменять заказ может только владелец или администратор.")
-        if order.status not in ACTIVE_STATUSES:
-            raise OrderValidationError("status", "Невозможно отменить заказ с текущим статусом.")
-        order.status = "cancelled_by_user" if is_owner and not is_admin else "cancelled"
-        order.cancelled_at = datetime.now(timezone.utc)
-        await self.session.flush()
-        return order
+    async def calculate_planner_quote(
+        self,
+        *,
+        selections: list[PlannerSelection],
+        promo_code: str | None = None,
+        address: str | None = None,
+        weeks: list[PlannerWeekRequest] | None = None,
+    ) -> PlannerQuote:
+        week_requests = weeks if weeks is not None else [
+            PlannerWeekRequest(week_start=None, selections=selections, enabled=True)
+        ]
+        if not week_requests:
+            week_requests = [PlannerWeekRequest(week_start=None, selections=selections, enabled=True)]
 
-    async def get_by_public_id(self, public_id: str) -> Order:
-        stmt = select(Order).where(Order.public_id == public_id)
-        result = await self.session.execute(stmt)
-        order = result.scalars().first()
-        if not order:
-            raise OrderNotFoundError(public_id)
-        return order
+        week_quotes = await self._calculate_multi_week_quotes(week_requests)
 
-    async def list_for_user(self, user: User) -> list[Order]:
+        subtotal = sum(week.subtotal for week in week_quotes if week.enabled)
+        discount, applied_code, promo_error = _apply_promo_code(subtotal, promo_code)
+        total = max(subtotal - discount, 0)
+
+        zone, delivery_available, zone_message = _detect_zone(address)
+
+        warnings: list[str] = []
+        for week in week_quotes:
+            warnings.extend(week.warnings)
+        if promo_error:
+            warnings.append(promo_error)
+        if zone_message:
+            warnings.append(zone_message)
+
+        primary_week = _resolve_primary_week(week_quotes)
+        items = primary_week.items if primary_week else []
+        currency = _resolve_currency(week_quotes)
+
+        return PlannerQuote(
+            items=items,
+            subtotal=subtotal,
+            discount=discount,
+            total=total,
+            currency=currency,
+            warnings=warnings,
+            promo_code=applied_code,
+            promo_code_error=promo_error,
+            delivery_zone=zone,
+            delivery_available=delivery_available,
+            weeks=week_quotes,
+        )
+
+    async def _calculate_multi_week_quotes(self, requests: list[PlannerWeekRequest]) -> list[PlannerWeekQuote]:
+        if not requests:
+            return []
+
+        offer_ids: set[uuid.UUID] = set()
+        for request in requests:
+            if not request.enabled:
+                continue
+            for selection in request.selections:
+                if selection.portions > 0:
+                    offer_ids.add(selection.offer_id)
+
+        offers: dict[uuid.UUID, DayOffer] = {}
+        if offer_ids:
+            stmt = select(DayOffer).options(selectinload(DayOffer.week)).where(DayOffer.id.in_(offer_ids))
+            offers_result = await self.session.execute(stmt)
+            offers = {offer.id: offer for offer in offers_result.scalars()}
+
+        week_starts = {request.week_start for request in requests if request.week_start}
+        weeks_map: dict[date, MenuWeek] = {}
+        if week_starts:
+            stmt_weeks = select(MenuWeek).where(MenuWeek.week_start.in_(week_starts))
+            weeks_result = await self.session.execute(stmt_weeks)
+            weeks_map = {week.week_start: week for week in weeks_result.scalars() if week.week_start}
+
+        quotes: list[PlannerWeekQuote] = []
+        for request in requests:
+            quotes.append(_build_week_quote(request, offers, weeks_map))
+        return quotes
+
+    async def list_orders_for_user(self, *, user: User) -> list[Order]:
+        stmt = select(Order).where(Order.user_id == user.id).order_by(Order.created_at.desc())
+        rows = await self.session.execute(stmt)
+        return list(rows.scalars())
+
+    async def list_orders_for_week(self, *, week_start: date) -> list[Order]:
         stmt = (
             select(Order)
-            .where(Order.user_id == user.id)
-            .order_by(Order.created_at.desc())
+            .where(Order.delivery_week_start == week_start)
+            .order_by(Order.day_of_week, Order.created_at)
         )
-        result = await self.session.execute(stmt)
-        return list(result.scalars())
+        rows = await self.session.execute(stmt)
+        return list(rows.scalars())
 
-    async def list_for_week(self, week_start: date, statuses: Iterable[str] | None = None) -> list[Order]:
-        stmt = select(Order).where(Order.delivery_week_start == week_start)
-        if statuses:
-            stmt = stmt.where(Order.status.in_(list(statuses)))
-        stmt = stmt.order_by(Order.day.asc(), Order.created_at.asc())
-        result = await self.session.execute(stmt)
-        return list(result.scalars())
+    async def update_order_count(self, *, order_id: str, new_count: int, actor: User) -> Order:
+        order = await self.session.get(Order, order_id)
+        if not order:
+            raise OrderNotFoundError(order_id)
+        if actor.role != UserRole.ADMIN and order.user_id != actor.id:
+            raise ForbiddenOrderActionError(order_id, "Нет доступа для изменения заказа")
+        if order.status not in _ACTIVE_STATUSES:
+            raise ForbiddenOrderActionError(order_id, "Заказ уже в обработке")
+        if new_count < 1 or new_count > settings.order_daily_limit:
+            raise ValidationError(field="count", message=f"Количество должно быть от 1 до {settings.order_daily_limit}")
+        order.count = new_count
+        await self.session.flush()
+        return order
 
-    async def set_status(self, public_id: str, status: str) -> None:
-        await self.session.execute(
-            update(Order)
-            .where(Order.public_id == public_id)
-            .values(status=status, updated_at=datetime.now(timezone.utc))
+    async def cancel_order(self, *, order_id: str, actor: User, reason: str | None = None) -> Order:
+        order = await self.session.get(Order, order_id)
+        if not order:
+            raise OrderNotFoundError(order_id)
+        if actor.role != UserRole.ADMIN and order.user_id != actor.id:
+            raise ForbiddenOrderActionError(order_id, "Нет доступа для отмены заказа")
+        if order.status not in _ACTIVE_STATUSES:
+            raise ForbiddenOrderActionError(order_id, "Заказ уже обработан")
+        order.status = OrderStatus.CANCELLED if actor.role == UserRole.ADMIN else OrderStatus.CANCELLED_BY_USER
+        await self.session.flush()
+        return order
+
+
+def _build_week_quote(
+    request: PlannerWeekRequest,
+    offers: dict[uuid.UUID, DayOffer],
+    weeks_map: dict[date, MenuWeek],
+) -> PlannerWeekQuote:
+    week_label = _resolve_week_label(request.week_start, weeks_map)
+
+    if not request.enabled:
+        return PlannerWeekQuote(
+            week_start=request.week_start,
+            week_label=week_label,
+            enabled=False,
+            menu_status="disabled",
+            items=[],
+            subtotal=0,
+            currency=None,
+            warnings=[],
         )
 
-    def _normalize_day(self, day: str) -> str:
-        normalized = DAY_MAPPING.get(day.strip().lower())
-        if not normalized:
-            raise OrderValidationError("day", "Допустимы только будние дни (понедельник-пятница).")
-        return normalized
+    aggregated: Counter[uuid.UUID] = Counter()
+    for selection in request.selections:
+        if selection.portions > 0:
+            aggregated[selection.offer_id] += selection.portions
 
-    def _generate_public_id(self, seed: str | int | None) -> str:
-        base = int(time.time())
-        uid_part = str(seed or "0")
-        return f"BLB-{self._base36(base)}-{self._base36_hash(uid_part)}-{self._base36_random()}"
+    has_menu_row = request.week_start is not None and request.week_start in weeks_map
 
-    def _base36(self, value: int) -> str:
-        chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        if value == 0:
-            return "0"
-        sign = "-" if value < 0 else ""
-        value = abs(value)
-        digits = []
-        while value:
-            value, rem = divmod(value, 36)
-            digits.append(chars[rem])
-        return sign + "".join(reversed(digits))
+    if not aggregated:
+        menu_status = "empty" if has_menu_row else "pending"
+        return PlannerWeekQuote(
+            week_start=request.week_start,
+            week_label=week_label,
+            enabled=True,
+            menu_status=menu_status,
+            items=[],
+            subtotal=0,
+            currency=None,
+            warnings=[],
+        )
 
-    def _base36_hash(self, value: str) -> str:
-        hashed = abs(hash(value)) % (36**4)
-        return self._base36(hashed).rjust(4, "0")[-4:]
+    items: list[PlannerLine] = []
+    warnings: list[str] = []
+    subtotal = 0
+    currency: str | None = None
+    menu_status = "pending" if not has_menu_row else "published"
 
-    def _base36_random(self) -> str:
-        return self._base36(secrets.randbits(20)).rjust(4, "0")[:4]
+    for offer_id, requested in aggregated.items():
+        offer = offers.get(offer_id)
+        if not offer:
+            message = "Предложение больше недоступно"
+            warnings.append(message)
+            items.append(
+                PlannerLine(
+                    offer_id=offer_id,
+                    day="",
+                    status="missing",
+                    requested_portions=requested,
+                    accepted_portions=0,
+                    unit_price=0,
+                    currency=currency or "GEL",
+                    subtotal=0,
+                    message=message,
+                )
+            )
+            continue
+
+        offer_week_start = offer.week.week_start if offer.week else None
+        if request.week_start and offer_week_start and offer_week_start != request.week_start:
+            message = "Предложение относится к другой неделе"
+            warnings.append(message)
+            items.append(
+                PlannerLine(
+                    offer_id=offer.id,
+                    day=offer.day_of_week.value,
+                    status="missing",
+                    requested_portions=requested,
+                    accepted_portions=0,
+                    unit_price=0,
+                    currency=currency or offer.price_currency,
+                    subtotal=0,
+                    message=message,
+                )
+            )
+            continue
+
+        currency = offer.price_currency
+        available_capacity = None
+        if offer.portion_limit is not None:
+            available_capacity = max(offer.portion_limit - offer.portions_reserved, 0)
+
+        accepted = requested
+        status = "ok"
+        message: str | None = None
+
+        if offer.status != DayOfferStatus.AVAILABLE:
+            status = offer.status.value
+            accepted = 0
+            message = "День недоступен для заказа"
+        elif available_capacity is not None:
+            if available_capacity <= 0:
+                status = "sold_out"
+                accepted = 0
+                message = "Все порции на этот день уже забронированы"
+            elif requested > available_capacity:
+                status = "partial"
+                accepted = available_capacity
+                message = f"Доступно только {available_capacity} порций"
+
+        line_subtotal = accepted * offer.price_amount
+        subtotal += line_subtotal
+        if message:
+            warnings.append(message)
+
+        items.append(
+            PlannerLine(
+                offer_id=offer.id,
+                day=offer.day_of_week.value,
+                status=status,
+                requested_portions=requested,
+                accepted_portions=accepted,
+                unit_price=offer.price_amount,
+                currency=offer.price_currency,
+                subtotal=line_subtotal,
+                message=message,
+            )
+        )
+
+        if menu_status == "pending":
+            menu_status = "published"
+
+    return PlannerWeekQuote(
+        week_start=request.week_start,
+        week_label=week_label,
+        enabled=True,
+        menu_status=menu_status,
+        items=items,
+        subtotal=subtotal,
+        currency=currency,
+        warnings=warnings,
+    )
+
+
+def _resolve_primary_week(weeks: list[PlannerWeekQuote]) -> PlannerWeekQuote | None:
+    for week in weeks:
+        if week.enabled:
+            return week
+    return weeks[0] if weeks else None
+
+
+def _resolve_currency(weeks: list[PlannerWeekQuote]) -> str:
+    for week in weeks:
+        if week.currency:
+            return week.currency
+    return "GEL"
+
+
+def _resolve_week_label(week_start: date | None, weeks_map: dict[date, MenuWeek]) -> str | None:
+    if not week_start:
+        return None
+    week = weeks_map.get(week_start)
+    if week and week.week_label:
+        return week.week_label
+    return _format_week_label(week_start)
+
+
+def _format_week_label(week_start: date | None) -> str | None:
+    if not week_start:
+        return None
+    return week_start.strftime("%d.%m.%Y")
+
+
+def _generate_order_id(user_pk: uuid.UUID | str | int) -> str:
+    if isinstance(user_pk, uuid.UUID):
+        user_val = user_pk.int
+    else:
+        user_val = int(user_pk)
+    timestamp = _base36(int(time.time()))
+    uid36 = _base36(abs(user_val))[-4:].rjust(4, "0")
+    rnd = _base36(secrets.randbits(20)).rjust(4, "0")[:4]
+    return f"BLB-{timestamp}-{uid36}-{rnd}"
+
+
+def _base36(value: int) -> str:
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if value == 0:
+        return "0"
+    neg = value < 0
+    value = abs(value)
+    result = []
+    while value:
+        value, digit = divmod(value, 36)
+        result.append(alphabet[digit])
+    if neg:
+        result.append("-")
+    return "".join(reversed(result))
+
+
+def _apply_promo_code(subtotal: int, promo_code: str | None) -> tuple[int, str | None, str | None]:
+    if not promo_code:
+        return 0, None, None
+
+    normalized = promo_code.strip().upper()
+    rule = _PROMO_CODES.get(normalized)
+    if not rule:
+        return 0, None, "Промокод не найден"
+
+    min_subtotal = int(rule.get("min_subtotal", 0))
+    if subtotal < min_subtotal:
+        required_lari = min_subtotal / 100
+        return 0, None, f"Минимальная сумма для промокода {normalized} — {required_lari:.0f} ₾"
+
+    discount = 0
+    if rule.get("type") == "percent":
+        discount = subtotal * int(rule.get("value", 0)) // 100
+    else:
+        discount = int(rule.get("value", 0))
+
+    discount = min(discount, subtotal)
+    return discount, normalized, None
+
+
+def _detect_zone(address: str | None) -> tuple[str | None, bool, str | None]:
+    if not address:
+        return None, False, "Укажите адрес, чтобы проверить доставку"
+
+    normalized = address.lower()
+    for zone, keywords in _DELIVERY_ZONES.items():
+        if any(keyword in normalized for keyword in keywords):
+            return zone, True, None
+
+    return None, False, "Адрес пока вне зоны доставки (центр и новый бульвар)"
+
+
+def _day_offset(day: DayOfWeek) -> int:
+    mapping = {
+        DayOfWeek.MONDAY: 0,
+        DayOfWeek.TUESDAY: 1,
+        DayOfWeek.WEDNESDAY: 2,
+        DayOfWeek.THURSDAY: 3,
+        DayOfWeek.FRIDAY: 4,
+    }
+    return mapping[day]
+
+
+__all__ = [
+    "OrderService",
+    "OrderDraft",
+    "PlannerSelection",
+    "PlannerLine",
+    "PlannerQuote",
+    "PlannerWeekRequest",
+    "PlannerWeekQuote",
+]

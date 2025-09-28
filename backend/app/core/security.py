@@ -1,74 +1,68 @@
-"""Security helpers: password hashing and JWT management."""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any
 
 import jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, ValidationError
 
 from .config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-class TokenPayload(BaseModel):
-    sub: str
-    exp: int
-    type: str
-    scopes: list[str] = []
-
-    @property
-    def expires_at(self) -> datetime:
-        return datetime.fromtimestamp(self.exp, tz=timezone.utc)
+class TokenType:
+    ACCESS = "access"
+    REFRESH = "refresh"
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password + settings.password_pepper)
+    return _pwd_context.hash(password)
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    try:
-        return pwd_context.verify(plain_password + settings.password_pepper, hashed_password)
-    except Exception:
-        return False
+def verify_password(password: str, password_hash: str) -> bool:
+    return _pwd_context.verify(password, password_hash)
 
 
-def _create_token(subject: str, ttl_seconds: int, *, token_type: str, scopes: Optional[list[str]] = None) -> str:
+def _create_token(subject: str, token_type: str, expires_delta: timedelta) -> str:
     now = datetime.now(tz=timezone.utc)
     payload: dict[str, Any] = {
         "sub": subject,
-        "exp": int((now + timedelta(seconds=ttl_seconds)).timestamp()),
-        "iat": int(now.timestamp()),
         "type": token_type,
-        "scopes": scopes or [],
+        "iat": int(now.timestamp()),
+        "exp": int((now + expires_delta).timestamp()),
     }
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 
-def create_access_token(subject: str, scopes: Optional[list[str]] = None) -> str:
-    return _create_token(subject, settings.jwt_access_ttl, token_type="access", scopes=scopes)
+def create_access_token(subject: str) -> str:
+    return _create_token(
+        subject,
+        TokenType.ACCESS,
+        timedelta(minutes=settings.jwt_access_token_ttl_minutes),
+    )
 
 
 def create_refresh_token(subject: str) -> str:
-    return _create_token(subject, settings.jwt_refresh_ttl, token_type="refresh")
+    return _create_token(
+        subject,
+        TokenType.REFRESH,
+        timedelta(minutes=settings.jwt_refresh_token_ttl_minutes),
+    )
 
 
-def decode_token(token: str) -> TokenPayload:
-    data = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-    try:
-        return TokenPayload(**data)
-    except ValidationError as exc:
-        raise jwt.InvalidTokenError("Invalid token payload") from exc
+def decode_token(token: str, expected_type: str | None = None) -> dict[str, Any]:
+    payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+    if expected_type and payload.get("type") != expected_type:
+        raise jwt.InvalidTokenError("unexpected token type")
+    return payload
 
 
 __all__ = [
-    "TokenPayload",
-    "hash_password",
-    "verify_password",
+    "TokenType",
     "create_access_token",
     "create_refresh_token",
     "decode_token",
+    "hash_password",
+    "verify_password",
 ]

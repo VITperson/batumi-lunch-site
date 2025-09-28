@@ -1,77 +1,54 @@
-"""FastAPI dependencies (db sessions, auth, rate limiting)."""
-
 from __future__ import annotations
 
-import uuid
-from datetime import datetime, timezone
+from collections.abc import AsyncIterator
 
-import redis.asyncio as aioredis
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.logging import set_trace_id
-from app.core.security import TokenPayload, decode_token
-from app.db import get_session
+from app.core.security import TokenType, decode_token
+from app.db.models.enums import UserRole
 from app.db.models.user import User
-from app.domain.users.service import UserService
+from app.db.session import get_session
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{settings.api_v1_prefix}/auth/login")
+_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+_redis_client: Redis | None = Redis.from_url(settings.redis_url, decode_responses=True) if settings.redis_url else None
 
 
-async def get_db() -> AsyncSession:
-    async for session in get_session():
+async def get_session_dep() -> AsyncIterator[AsyncSession]:
+    async with get_session() as session:
         yield session
 
 
-async def get_current_user(token: str = Depends(oauth2_scheme), session: AsyncSession = Depends(get_db)) -> User:
+async def get_redis() -> Redis | None:
+    return _redis_client
+
+
+async def get_current_user(
+    token: str = Depends(_oauth2_scheme),
+    session: AsyncSession = Depends(get_session_dep),
+) -> User:
     try:
-        payload = decode_token(token)
+        payload = decode_token(token, expected_type=TokenType.ACCESS)
     except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Недействительный токен") from None
-    if payload.type != "access":
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Недействительный тип токена")
-    set_trace_id(payload.sub)
-    user_id = uuid.UUID(payload.sub)
-    user = await UserService(session).get_by_id(user_id)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token") from None
+
+    subject = payload.get("sub")
+    if not subject:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    user = await session.get(User, subject)
     if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Пользователь не найден")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User inactive")
     return user
 
 
 async def get_current_admin(user: User = Depends(get_current_user)) -> User:
-    if "admin" not in (user.roles or []):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Требуется роль администратора")
+    if user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
     return user
 
 
-class RateLimiter:
-    def __init__(self, key_prefix: str, limit: int, window_seconds: int) -> None:
-        self.key_prefix = key_prefix
-        self.limit = limit
-        self.window_seconds = window_seconds
-        self.redis = aioredis.from_url(settings.redis_dsn, decode_responses=True)
-
-    async def __call__(self, user: User = Depends(get_current_user)) -> None:
-        key = f"{self.key_prefix}:{user.id}"
-        now = datetime.now(timezone.utc)
-        try:
-            ttl = await self.redis.ttl(key)
-            count = await self.redis.incr(key)
-        except Exception:
-            # Redis unavailable: skip limiting fail-open.
-            return
-        if ttl == -1:
-            await self.redis.expire(key, self.window_seconds)
-        if count > self.limit:
-            retry_after = max(ttl, 0) if ttl > 0 else self.window_seconds
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Слишком много запросов. Попробуйте позже.",
-                headers={"Retry-After": str(retry_after)},
-            )
-
-
-order_rate_limiter = RateLimiter("rate:orders", limit=1, window_seconds=10)
-broadcast_rate_limiter = RateLimiter("rate:broadcasts", limit=3, window_seconds=60)
+__all__ = ["get_session_dep", "get_current_user", "get_current_admin", "get_redis"]

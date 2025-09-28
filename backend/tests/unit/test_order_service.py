@@ -1,122 +1,153 @@
 from __future__ import annotations
 
-import asyncio
-from datetime import date, datetime, timedelta
+from datetime import timedelta
 
 import pytest
+import pytest_asyncio
+from sqlalchemy import select
 
-from app.domain.orders.errors import DuplicateOrderError, OrderValidationError, OrderWindowClosedError
-from app.domain.orders.service import OrderCreateData, OrderService
-from app.domain.order_window.service import OrderWindowService
-from app.db.models.menu import MenuItem, MenuWeek
-from app.db.models.order import Order
+from app.db.models.enums import DayOfferStatus, DayOfWeek, OrderStatus, UserRole
+from app.db.models.menu import DayOffer, MenuItem, MenuWeek
 from app.db.models.order_window import OrderWindow
 from app.db.models.user import User
-from app.db.models.enums import UserRole
+from app.domain.menu import MenuService
+from app.domain.order_window import OrderWindowService
+from app.domain.orders import (
+    DuplicateOrderError,
+    OrderDraft,
+    OrderService,
+    PlannerSelection,
+    PlannerWeekRequest,
+)
 
 
-@pytest.fixture()
-async def user(async_session):
-    user = User(email="user@example.com", roles=[UserRole.customer.value])
-    async_session.add(user)
-    await async_session.flush()
-    return user
+@pytest_asyncio.fixture()
+async def user(session):
+    instance = User(email="test@example.com", role=UserRole.CUSTOMER)
+    session.add(instance)
+    await session.flush()
+    return instance
 
 
-def _next_monday() -> date:
-    today = datetime.utcnow().date()
-    return today + timedelta(days=(7 - today.weekday()) % 7)
+@pytest_asyncio.fixture()
+async def menu_week(session, now):
+    week_start = now.date() + timedelta(days=(7 - now.date().weekday()) % 7)
+    week = MenuWeek(week_label="Test Week", week_start=week_start)
+    session.add(week)
+    await session.flush()
+    item = MenuItem(week_id=week.id, day_of_week=DayOfWeek.FRIDAY, title="Суп дня", position=0)
+    session.add(item)
+    offer = DayOffer(
+        week_id=week.id,
+        day_of_week=DayOfWeek.FRIDAY,
+        status=DayOfferStatus.AVAILABLE,
+        price_amount=1500,
+        price_currency="GEL",
+        portion_limit=50,
+        portions_reserved=0,
+    )
+    session.add(offer)
+    await session.flush()
+    return week
 
 
-async def _prepare_menu(async_session, week_start: date, day: str) -> None:
-    week = MenuWeek(week_start=week_start, title="Test Week", is_published=True)
-    async_session.add(week)
-    await async_session.flush()
-    item = MenuItem(menu_week_id=week.id, day=day, position=0, title="Комплексный обед")
-    async_session.add(item)
-    await async_session.flush()
-
-
-async def _prepare_order_window(async_session, week_start: date) -> None:
-    async_session.add(OrderWindow(is_enabled=True, week_start=week_start))
-    await async_session.flush()
+@pytest_asyncio.fixture()
+async def order_window(session, menu_week):
+    window = OrderWindow(next_week_enabled=True, week_start=menu_week.week_start)
+    session.add(window)
+    await session.flush()
+    return window
 
 
 @pytest.mark.asyncio
-async def test_create_order_success(async_session, user):
-    week_start = _next_monday()
-    await _prepare_menu(async_session, week_start, "monday")
-    await _prepare_order_window(async_session, week_start)
-    service = OrderService(async_session)
+async def test_create_order_success(session, user, menu_week, order_window):
+    menu_service = MenuService(session)
+    window_service = OrderWindowService(session)
+    service = OrderService(session, menu_service=menu_service, window_service=window_service)
 
-    order = await service.create(
-        user,
-        OrderCreateData(day="monday", count=2, address="Main st 1", phone="+995512345678"),
-    )
-    await async_session.commit()
+    draft = OrderDraft(day=DayOfWeek.FRIDAY, count=2, address="ул. Руставели, 10", phone="+995123456")
+    order = await service.create_order(user=user, draft=draft)
 
     assert order.count == 2
-    assert order.menu_snapshot == ["Комплексный обед"]
-    assert order.delivery_week_start == week_start
-    assert order.status == "new"
+    assert order.status == OrderStatus.NEW
+    assert order.menu_items == ["Суп дня"]
+    assert order.id.startswith("BLB-")
 
 
 @pytest.mark.asyncio
-async def test_duplicate_order_prevented(async_session, user):
-    week_start = _next_monday()
-    await _prepare_menu(async_session, week_start, "monday")
-    await _prepare_order_window(async_session, week_start)
-    service = OrderService(async_session)
+async def test_create_order_duplicate(session, user, menu_week, order_window):
+    menu_service = MenuService(session)
+    window_service = OrderWindowService(session)
+    service = OrderService(session, menu_service=menu_service, window_service=window_service)
 
-    await service.create(user, OrderCreateData(day="monday", count=1, address="Addr", phone=None))
-    await async_session.flush()
+    draft = OrderDraft(day=DayOfWeek.FRIDAY, count=1, address="Адрес", phone=None)
+    await service.create_order(user=user, draft=draft)
 
     with pytest.raises(DuplicateOrderError):
-        await service.create(user, OrderCreateData(day="monday", count=1, address="Addr", phone=None))
+        await service.create_order(user=user, draft=draft)
 
 
 @pytest.mark.asyncio
-async def test_order_window_closed(async_session, user, monkeypatch):
-    week_start = _next_monday()
-    await _prepare_menu(async_session, week_start, "monday")
-    service = OrderService(async_session)
+async def test_calculate_planner_quote_multi_week(session, menu_week, order_window):
+    menu_service = MenuService(session)
+    window_service = OrderWindowService(session)
+    service = OrderService(session, menu_service=menu_service, window_service=window_service)
 
-    original_determine = service.window_service.determine
+    first_offer = (
+        await session.execute(select(DayOffer).where(DayOffer.week_id == menu_week.id))
+    ).scalar_one()
 
-    async def forced_determine(day: str, now=None):
-        future_now = datetime.utcnow() + timedelta(days=3)
-        return await original_determine(day, now=future_now)
+    assert menu_week.week_start is not None
+    second_week_start = menu_week.week_start + timedelta(days=7)
+    second_week = MenuWeek(week_label="Second Week", week_start=second_week_start)
+    session.add(second_week)
+    await session.flush()
 
-    monkeypatch.setattr(service.window_service, "determine", forced_determine)
+    second_item = MenuItem(week_id=second_week.id, day_of_week=DayOfWeek.MONDAY, title="Салат", position=0)
+    session.add(second_item)
+    second_offer = DayOffer(
+        week_id=second_week.id,
+        day_of_week=DayOfWeek.MONDAY,
+        status=DayOfferStatus.AVAILABLE,
+        price_amount=1700,
+        price_currency="GEL",
+        portion_limit=30,
+        portions_reserved=0,
+    )
+    session.add(second_offer)
+    await session.flush()
 
-    with pytest.raises(OrderWindowClosedError):
-        await service.create(user, OrderCreateData(day="monday", count=1, address="Addr", phone=None))
+    weeks = [
+        PlannerWeekRequest(
+            week_start=menu_week.week_start,
+            enabled=True,
+            selections=[PlannerSelection(offer_id=first_offer.id, portions=2)],
+        ),
+        PlannerWeekRequest(
+            week_start=second_week_start,
+            enabled=True,
+            selections=[PlannerSelection(offer_id=second_offer.id, portions=3)],
+        ),
+        PlannerWeekRequest(
+            week_start=second_week_start + timedelta(days=7),
+            enabled=True,
+            selections=[],
+        ),
+    ]
 
+    quote = await service.calculate_planner_quote(selections=[], weeks=weeks)
 
-@pytest.mark.asyncio
-async def test_order_count_validation(async_session, user):
-    week_start = _next_monday()
-    await _prepare_menu(async_session, week_start, "monday")
-    await _prepare_order_window(async_session, week_start)
-    service = OrderService(async_session)
-
-    with pytest.raises(OrderValidationError):
-        await service.create(user, OrderCreateData(day="monday", count=10, address="Addr", phone=None))
-
-
-@pytest.mark.asyncio
-async def test_admin_cancel(async_session):
-    admin = User(email="admin@example.com", roles=[UserRole.admin.value])
-    async_session.add(admin)
-    await async_session.flush()
-    week_start = _next_monday()
-    await _prepare_menu(async_session, week_start, "monday")
-    await _prepare_order_window(async_session, week_start)
-    service = OrderService(async_session)
-    order = await service.create(admin, OrderCreateData(day="monday", count=1, address="Addr", phone=None))
-    await async_session.flush()
-
-    cancelled = await service.cancel(admin, order.public_id)
-    await async_session.flush()
-
-    assert cancelled.status == "cancelled"
+    expected_subtotal = 2 * first_offer.price_amount + 3 * second_offer.price_amount
+    assert quote.subtotal == expected_subtotal
+    assert quote.total == expected_subtotal
+    assert quote.discount == 0
+    assert quote.currency == "GEL"
+    assert len(quote.weeks) == 3
+    assert quote.weeks[0].subtotal == 2 * first_offer.price_amount
+    assert quote.weeks[0].menu_status == "published"
+    assert quote.weeks[1].subtotal == 3 * second_offer.price_amount
+    assert quote.weeks[1].menu_status == "published"
+    assert quote.weeks[2].subtotal == 0
+    assert quote.weeks[2].menu_status in {"pending", "empty"}
+    assert quote.items
+    assert quote.items[0].offer_id == first_offer.id

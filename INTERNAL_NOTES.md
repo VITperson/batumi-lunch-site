@@ -1,66 +1,53 @@
-# Internal Notes — Batumi Lunch Web Migration
+# Internal Notes – Batumi Lunch Web Migration
 
-## Tech Stack & Platform Decisions
-- Frontend: Next.js (React) SPA with SSR; Node 20+ runtime; Chakra UI or MUI allowed per roadmap (exact choice TBD → see TODO).
-- Backend: FastAPI (Python 3.13) with modular structure (core/settings, api/v1, domain services, db models, workers).
-- Persistence: PostgreSQL 15+ (SQLAlchemy via async engine); Redis for sessions/rate limiting; MinIO (S3-compatible) for menu photos; local `.env` for development only.
-- Messaging/Workers: Celery or RQ workers for broadcasts & async tasks; REST-first API; OpenAPI contract + generated TS client for frontend.
-- Auth: JWT (access + refresh) with refresh in httpOnly cookie; roles `customer` and `admin`; admins linked to Telegram IDs for coexistence.
-- Observability: JSON logs with trace-id, Prometheus metrics, Sentry-style error tracking, `/healthz` and `/readyz` endpoints.
+## Stack & Architecture (from `roadmap.md`)
+- Frontend: Next.js (React) SPA with SSR support; routes: `/`, `/menu`, `/order/new`, `/account/orders`, `/orders/{id}`, `/admin`, `/admin/menu`, `/admin/reports`, `/admin/broadcast`, `/login`.
+- Backend: FastAPI exposing REST API described in roadmap (`/menu/week`, `/orders`, `/orders/{id}`, `/orders/{id}/cancel`, `/orders?mine=1`, `/admin/*`).
+- Persistence: PostgreSQL tables `users`, `orders`, `menu_weeks`, `menu_items`, `order_windows`, `broadcasts`; required indexes on `delivery_date`, `status`, `user_id`.
+- Cache/session: Redis for session storage, rate limiting (`POST /orders`, `/admin/broadcasts`).
+- Storage: S3-compatible bucket (MinIO locally) for menu/media uploads.
+- Async work: Celery/RQ worker tier to handle broadcasts/notifications.
+- Observability: structured JSON logging, Prometheus metrics, Sentry, `/healthz`, `/readyz` endpoints.
 
-## Key API Contracts (v1)
-- `GET /api/v1/menu/week?date=YYYY-MM-DD` → `{week, items[]}`; 404 if absent.
-- `POST /api/v1/orders` → `{orderId, status}`; validates `{day, count, address, phone, weekStart}`; errors: 400/409/422.
-- `PATCH /api/v1/orders/{id}` → partial update `{count}` or `{address}`; errors: 403/404/409.
-- `POST /api/v1/orders/{id}/cancel` → `{orderId, status}`; errors: 403/404.
-- `GET /api/v1/orders?mine=1|week=...` → list; errors: 401/500.
-- `POST /api/v1/admin/broadcasts` → `{id, sent, failed}`; errors: 400/403/429.
-- `PUT /api/v1/admin/menu/week` → `{week}`; errors: 400/403.
-- `PUT /api/v1/admin/menu/{day}` → `{day, items[]}`; errors: 400/403.
-- `POST /api/v1/admin/menu/photo` → multipart image upload → `{url}`; errors: 400/413/500.
-- `POST /api/v1/admin/order-window` → `{enabled, weekStart}`; errors: 400/403.
-- Health endpoints: `/healthz`, `/readyz`.
+## Domain Entities & Fields (from `bot.py`)
+- `User`: `user_id`, `address` (free-text), `phone` (raw string from Telegram contact), optional `username`.
+- `Order`: `order_id` (format `BLB-<ts36>-<uid36>-<rnd>`), `user_id`, `username`, `day`, `count`, `menu` (comma-joined string), `status` (`new`, `cancelled`, `cancelled_by_user`), `created_at`, `updated_at`, `delivery_week_start` (ISO date string), `next_week` (bool), `address`, `phone`.
+- `Menu`: `week` label plus `menu[day]` list of dish strings; optional day photo map.
+- `Order window`: `next_week_enabled` flag with `week_start` ISO date; governs ability to book next week deliveries.
+- `Broadcast recipients`: union of all `user_id`s seen in users/orders JSON, excluding admin.
 
-## Data Model Targets
-- `users`: id (uuid/int), telegram_id, roles, address, phone, created_at, updated_at.
-- `orders`: id (UUID/ULID), public_id (BLB-… format), user_id FK, day (enum Mon-Fri), count (1-4), status (`new`, `cancelled_by_user`, `cancelled`, future statuses TBD), menu_snapshot JSON, address_snapshot, phone_snapshot, delivery_week_start (date), next_week (bool), created_at, updated_at.
-- `menu_weeks`: id, week_start (date, unique), title, is_published, created_at, updated_at.
-- `menu_items`: id, menu_week_id FK, day (enum), position, title, description, photo_url.
-- `order_windows`: id, week_start (date), enabled (bool), created_at, updated_at.
-- `broadcasts`: id, author_id, channels[], html_body, status, sent_at, created_at.
-- Index guidance: orders by (delivery_week_start, status), (user_id, day, delivery_week_start); menu_items by (menu_week_id, day, position).
+## Core Business Rules
+- Order window: `_is_day_available_for_order(day)` disallows past days; same-day orders close after `ORDER_CUTOFF_HOUR=10`. If `next_week_enabled` and week start in future, selections target next week; otherwise stored against current week start (Monday).
+- Order count: only 1–4 portions accepted (`select_count`), with textual and numeric aliases.
+- Anti-spam: users must wait 10 seconds between order submissions (`context.user_data['last_order_ts']`).
+- Duplicate detection: `find_user_order_same_day(user_id, day, week_start)` checks active (non cancelled) orders for selected week; user can either cancel existing (`status=cancelled_by_user`) or merge counts (sums quantities, persists to existing order, notifies admin).
+- Profile persistence: `users.json` stores address/phone; `ensure_user_registered` guarantees entry; address is required before confirmation, phone optional but encouraged (button to send contact).
+- Confirmation: order saved only after user chooses “Подтверждаю”. Admin notified with detailed HTML message; user receives summary + action buttons.
+- Order modification: owner/admin may adjust quantity while `status=='new'`; updates persisted with new `updated_at` and admin notification.
+- Cancellation: owner cancels via command/callback yielding `cancelled_by_user`; admin cancellation uses `cancelled`.
+- Reporting: weekly/day reports aggregate counts, totals, include cancelled orders separately, display Telegram deep links.
+- Menu management: admin can set week title, add/edit/remove dishes per day, upload photo, toggle next-week orders (sets `next_week_enabled` and computes `_next_week_start()`).
 
-## Domain Rules Extracted from `bot.py`
-- Days limited to Mon–Fri via `DAY_TO_INDEX`; invalid day → rejection.
-- Order window: `_load_order_window()` toggles `next_week_enabled` with `week_start`; `_is_day_available_for_order()` enforces:
-  - Past days blocked unless next week window active.
-  - Same-day orders cut off at `ORDER_CUTOFF_HOUR = 10` (10:00 local).
-  - When next week window expires, flag auto-resets.
-- Duplicate prevention: `find_user_order_same_day(user_id, day, week_start)` finds active (non-cancelled) orders in same week, returning latest order; UI asks to overwrite or adjust.
-- Anti-spam: selecting count/order limited to once every 10 seconds (`last_order_ts`).
-- Order ID format: `BLB-{timestamp base36}-{uid tail base36}-{random base36}` via `make_order_id`.
-- Order persistence: JSON storage; `save_order` writes snapshot with `status="new"`; status transitions via `set_order_status` to `cancelled_by_user` (self) or `cancelled` (admin).
-- Profiles: `users.json` stores address + phone; `address_phone` step saves contact via Telegram contact or text; requires address before confirmation.
-- Menu handling: `menu.json` includes `week` label and `menu{day: items[]}`; admin flows allow CRUD on menu text and `Menu.jpeg` + per-day photos `DishPhotos/*`.
-- Broadcasts: `/sms <html>` sends HTML message to all users except admin; recipients aggregated from users + orders via `get_broadcast_recipients`.
-- Reports: admin weekly summaries aggregate counts per day, separate cancelled orders.
-- Pricing: constant `PRICE_LARI = 15`; total = count * price (no currency conversion yet).
+## Validation & Data Handling
+- Address input prompted with guideline text; stored verbatim, minimal validation (non-empty string).
+- Phone numbers preserved as provided; sanitized copy for tel-link in operator contacts via `re.sub(r"[^\d+]", "", phone)`.
+- Menus validated on load to ensure `{'week': str, 'menu': dict}`.
+- JSON saves use atomic write via temp file + `os.replace` for idempotency.
+- Duplicate week orders ensure week context via `delivery_week_start`; fallback to timestamp range of current week if missing.
 
-## Bot ↔ Web UI Mapping
-- `/start`, `🔄 В начало` → `/` (landing/onboarding with CTA to view menu/order).
-- `Показать меню на неделю` → `/menu` (tabbed week/day view with gallery from menu items).
-- `Заказать обед` dialogue → `/order/new` wizard with steps: select day & quantity → address/contact → confirmation.
-- Duplicate order inline resolution → modal/dialog in `/order/new` or `/orders/{id}` with options to overwrite or keep.
-- `Мои заказы` & inline change/cancel → `/account/orders` list + `/orders/{id}` detail; actions for update/cancel using REST endpoints.
-- Admin “Показать заказы на эту неделю” → `/admin/reports` (filters by day/week, CSV export).
-- Admin menu management commands → `/admin/menu` (week CRUD, day item editing, photo upload, order window toggle).
-- `/order <ID>` → `/orders/{id}` (requires owner/admin). `/cancel <ID>` → `/orders/{id}` cancel action.
-- `/sms` broadcasts → `/admin/broadcast` form with rate limiting and segmentation (future).
-- Operator contacts button → contact modal accessible from `/` and header.
+## Conversation → Web Mapping
+- `/start`, `🔄 В начало` → landing `/` with onboarding CTA.
+- `Показать меню на неделю` → `/menu` (tabbed daily view with optional images).
+- `Заказать обед` → `/order/new` multi-step wizard (day/count → address/contact → confirm).
+- `Мои заказы` → `/account/orders` list with inline actions (change/cancel).
+- `/order <ID>` + inline keyboards → `/orders/{id}` detail view (with admin/customer access control).
+- `/cancel <ID>` + callbacks → action on `/orders/{id}` (cancel endpoint/button).
+- `Показать заказы на эту неделю` → `/admin/reports` (daily/weekly aggregates, cancel audit trail).
+- `Управление меню` → `/admin/menu` (week label, CRUD dishes, photo upload, next-week toggle).
+- `/sms` → `/admin/broadcast` (HTML broadcast form with rate limiting).
+- “Связаться с человеком” → contact modal with operator handle/phone/Instagram.
 
-## Open Implementation TODOs
-- Choose specific UI component library (Chakra vs MUI) consistent across frontend. (TODO: select per team alignment.)
-- Define exact Redis key schema for sessions and rate limiting. (TODO).
-- Clarify notification channels (email/SMS/push) for broadcast & order confirmations. (TODO; default to log stub).
-- Determine integration with Telegram OAuth vs email/password; roadmap mentions magic-link—pending decision. (TODO with placeholder auth provider).
+## Open UX / Feature Notes
+- Existing UX already implies saved addresses, ability to plan next week, highlight duplicates, show confirmation gif.
+- Roadmap adds enhancements: calendar picker, optional online payments, notifications (email/SMS/push), admin KPI dashboard; mark where TODOs or safe stubs required.
 

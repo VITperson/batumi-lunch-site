@@ -1,6 +1,15 @@
 # Batumi Lunch Bot → Web Roadmap
 
 ## Executive Summary
+
+## Implementation Status
+- ✅ Backend API: см. `backend/app/api/v1`
+- ✅ Доменные сервисы: `backend/app/domain` (портированы из Telegram-бота)
+- ✅ Миграции БД: `backend/app/db/migrations`
+- ✅ Скрипты миграции/сидов: `scripts/migrate_json_to_db.py`, `scripts/seed_menu.py`
+- ✅ Frontend Next.js: `frontend/app` (пользовательские и админские страницы)
+- ✅ CI / Docker: `.github/workflows/ci.yml`, `deploy/docker-compose.yml`, Dockerfile.api/web
+
 - Telegram-бот реализован в одном модуле с 14 состояниями диалога и хранит все данные в JSON, что усложняет масштабирование и аналитику (см. `bot.py:83-99`).
 - Ключевые сценарии: просмотр меню, оформление заказа с дедупликацией, управление меню и отчёты админа; их нужно перенести в веб с улучшенной навигацией (`bot.py:951-1760`, `bot.py:1189-1385`).
 - Доменные сущности (пользователи, заказы, меню, окно заказов) уже выделены и могут быть вынесены в слой сервисов для переиспользования (`bot.py:240-520`, `orders.json`, `users.json`).

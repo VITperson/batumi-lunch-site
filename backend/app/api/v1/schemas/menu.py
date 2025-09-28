@@ -1,30 +1,67 @@
 from __future__ import annotations
 
-from datetime import date
-from pydantic import BaseModel, Field, HttpUrl
+from datetime import date, datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+
+class MenuDayPriceResponse(BaseModel):
+    amount: int
+    currency: str
+
+
+class MenuDayResponse(BaseModel):
+    day: str
+    offerId: UUID | None = None
+    status: str
+    dishes: list[str] = Field(default_factory=list)
+    photoUrl: str | None = None
+    price: MenuDayPriceResponse
+    calories: int | None = None
+    allergens: list[str] = Field(default_factory=list)
+    portionLimit: int | None = None
+    portionsReserved: int = 0
+    portionsAvailable: int | None = None
+    badge: str | None = None
+    orderDeadline: datetime | None = None
+    notes: str | None = None
+
+
+class MenuResponse(BaseModel):
+    week: str
+    weekStart: date | None
+    items: list[MenuDayResponse]
+
+
+class MenuUpdateRequest(BaseModel):
+    items: list[str] = Field(default_factory=list)
 
 
 class MenuWeekRequest(BaseModel):
-    week_start: date
-    title: str = Field(..., min_length=3)
-    publish: bool | None = None
-
-
-class MenuItemPayload(BaseModel):
-    title: str = Field(..., min_length=2)
-    description: str | None = None
-    photo_url: HttpUrl | str | None = None
-
-
-class MenuDayUpdateRequest(BaseModel):
-    week_start: date
-    day: str
-    items: list[MenuItemPayload]
-
-
-class MenuWeekResponse(BaseModel):
-    week_start: date
     title: str
-    is_published: bool
-    hero_image_url: str | None
-    items: dict[str, list[MenuItemPayload]]
+
+
+class MenuWeekSummaryResponse(BaseModel):
+    label: str
+    weekStart: date | None
+    isCurrent: bool
+
+
+class PlannerPresetResponse(BaseModel):
+    id: UUID
+    slug: str
+    title: str
+    description: str | None = None
+    days: list[str] = Field(default_factory=list)
+    portions: int = 1
+
+
+__all__ = [
+    "MenuResponse",
+    "MenuDayResponse",
+    "MenuUpdateRequest",
+    "MenuWeekRequest",
+    "MenuWeekSummaryResponse",
+    "PlannerPresetResponse",
+]
