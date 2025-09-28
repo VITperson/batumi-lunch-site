@@ -18,6 +18,7 @@ from app.domain.orders import (
     OrderNotFoundError,
     OrderService,
     OrderWindowClosedError,
+    PlannerCheckoutResult,
     PlannerSelection,
     PlannerWeekRequest,
     ValidationError,
@@ -25,6 +26,9 @@ from app.domain.orders import (
 from app.domain.users import UserService
 
 from ..schemas.orders import (
+    PlannerCheckoutRequest,
+    PlannerCheckoutResponse,
+    PlannerCheckoutWeekResponse,
     OrderCalcItemResponse,
     OrderCalcRequest,
     OrderCalcResponse,
@@ -141,6 +145,79 @@ async def calculate_planner_order(
                 warnings=week.warnings,
             )
             for week in quote.weeks
+        ],
+    )
+
+
+@router.post("/checkout", response_model=PlannerCheckoutResponse, status_code=status.HTTP_201_CREATED)
+async def checkout_planner_order(
+    request: PlannerCheckoutRequest,
+    user=Depends(get_current_user),
+    session: AsyncSession = Depends(get_session_dep),
+    redis: Redis | None = Depends(get_redis),
+) -> PlannerCheckoutResponse:
+    order_service = _build_services(session, redis)
+    user_service = UserService(session)
+
+    selections = [
+        PlannerSelection(offer_id=selection.offerId, portions=selection.portions)
+        for selection in request.selections
+    ]
+
+    weeks = None
+    if request.weeks is not None:
+        weeks = [
+            PlannerWeekRequest(
+                week_start=week.weekStart,
+                enabled=week.enabled,
+                selections=[
+                    PlannerSelection(offer_id=item.offerId, portions=item.portions)
+                    for item in week.selections
+                ],
+            )
+            for week in request.weeks
+        ]
+
+    try:
+        result: PlannerCheckoutResult = await order_service.create_planner_template(
+            user=user,
+            selections=selections,
+            weeks=weeks,
+            address=request.address,
+            promo_code=request.promoCode,
+            repeat_weeks=request.repeatWeeks,
+            weeks_count=request.weeksCount,
+        )
+    except ValidationError as err:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"field": err.field, "message": err.message},
+        ) from err
+
+    await user_service.update_profile(user, address=request.address)
+    await session.flush()
+
+    return PlannerCheckoutResponse(
+        templateId=result.template_id,
+        subtotal=result.subtotal,
+        discount=result.discount,
+        total=result.total,
+        currency=result.currency,
+        promoCode=result.promo_code,
+        deliveryZone=result.delivery_zone,
+        deliveryAvailable=result.delivery_available,
+        weeks=[
+            PlannerCheckoutWeekResponse(
+                index=week.index,
+                weekStart=week.week_start,
+                label=week.label,
+                enabled=week.enabled,
+                menuStatus=week.menu_status,
+                subtotal=week.subtotal,
+                currency=week.currency,
+                warnings=week.warnings,
+            )
+            for week in result.weeks
         ],
     )
 

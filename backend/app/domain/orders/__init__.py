@@ -9,6 +9,8 @@ from .errors import (
 from .service import (
     OrderDraft,
     OrderService,
+    PlannerCheckoutResult,
+    PlannerCheckoutWeek,
     PlannerLine,
     PlannerQuote,
     PlannerSelection,
@@ -24,6 +26,8 @@ __all__ = [
     "PlannerQuote",
     "PlannerWeekRequest",
     "PlannerWeekQuote",
+    "PlannerCheckoutWeek",
+    "PlannerCheckoutResult",
     "OrderDomainError",
     "OrderNotFoundError",
     "OrderWindowClosedError",
