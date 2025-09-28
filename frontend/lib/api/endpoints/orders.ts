@@ -82,6 +82,38 @@ export type PlannerWeekQuote = {
   warnings: string[];
 };
 
+export type PlannerCheckoutRequest = {
+  address: string;
+  promoCode?: string | null;
+  repeatWeeks: boolean;
+  weeksCount: number;
+  selections: PlannerSelectionRequest[];
+  weeks?: PlannerWeekSelectionRequest[];
+};
+
+export type PlannerCheckoutWeek = {
+  index: number;
+  weekStart: string | null;
+  label: string | null;
+  enabled: boolean;
+  menuStatus: string;
+  subtotal: number;
+  currency: string | null;
+  warnings: string[];
+};
+
+export type PlannerCheckoutResponse = {
+  templateId: string;
+  subtotal: number;
+  discount: number;
+  total: number;
+  currency: string;
+  promoCode?: string | null;
+  deliveryZone?: string | null;
+  deliveryAvailable: boolean;
+  weeks: PlannerCheckoutWeek[];
+};
+
 export async function createOrder(token: string, body: CreateOrderBody): Promise<OrderPayload> {
   const client = apiClient(token);
   const { data } = await client.post<OrderPayload>("/orders", body);
@@ -91,6 +123,15 @@ export async function createOrder(token: string, body: CreateOrderBody): Promise
 export async function calculatePlannerOrder(body: OrderCalcRequest): Promise<OrderCalcResponse> {
   const client = apiClient();
   const { data } = await client.post<OrderCalcResponse>("/orders/calc", body);
+  return data;
+}
+
+export async function checkoutPlannerOrder(
+  token: string,
+  body: PlannerCheckoutRequest,
+): Promise<PlannerCheckoutResponse> {
+  const client = apiClient(token);
+  const { data } = await client.post<PlannerCheckoutResponse>("/orders/checkout", body);
   return data;
 }
 

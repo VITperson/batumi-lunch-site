@@ -97,6 +97,38 @@ class PlannerWeekQuoteResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class PlannerCheckoutRequest(BaseModel):
+    address: str
+    promoCode: str | None = None
+    repeatWeeks: bool = True
+    weeksCount: int = Field(default=1, ge=1, le=8)
+    selections: list[PlannerSelectionRequest] = Field(default_factory=list)
+    weeks: list[PlannerWeekSelectionRequest] | None = None
+
+
+class PlannerCheckoutWeekResponse(BaseModel):
+    index: int
+    weekStart: date | None = None
+    label: str | None = None
+    enabled: bool
+    menuStatus: str
+    subtotal: int
+    currency: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class PlannerCheckoutResponse(BaseModel):
+    templateId: UUID
+    subtotal: int
+    discount: int
+    total: int
+    currency: str
+    promoCode: str | None = None
+    deliveryZone: str | None = None
+    deliveryAvailable: bool
+    weeks: list[PlannerCheckoutWeekResponse] = Field(default_factory=list)
+
+
 __all__ = [
     "OrderCreateRequest",
     "OrderUpdateRequest",
@@ -109,4 +141,7 @@ __all__ = [
     "OrderCalcResponse",
     "OrderCalcItemResponse",
     "PlannerWeekQuoteResponse",
+    "PlannerCheckoutRequest",
+    "PlannerCheckoutResponse",
+    "PlannerCheckoutWeekResponse",
 ]
